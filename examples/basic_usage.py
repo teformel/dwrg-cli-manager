@@ -59,9 +59,7 @@ def main() -> int:
             print(f"   - {server.name:<12} {server.region}  {server.endpoint}{mark}")
 
         print("\n2. 新增一个自定义渠道服")
-        servers.add_server(
-            name=DEMO_SERVER, endpoint="https://demo.example.com", region="CN"
-        )
+        servers.add_server(name=DEMO_SERVER, endpoint="https://demo.example.com", region="CN")
         print(f"   现有渠道服 {len(servers.list_servers())} 个")
 
         print("\n3. 创建账号")
@@ -70,9 +68,7 @@ def main() -> int:
             server="official",
             password=DEMO_PASSWORD,
         )
-        print(
-            f"   ✓ {account.username}  id={account.display_id()}  server={account.server}"
-        )
+        print(f"   ✓ {account.username}  id={account.display_id()}  server={account.server}")
 
         print("\n4. 校验密码")
         passed = accounts.authenticate(DEMO_USERNAME, DEMO_PASSWORD)
@@ -81,19 +77,13 @@ def main() -> int:
         print(f"   错误密码 -> {'通过（不符合预期）' if rejected else '按预期拒绝'}")
 
         print("\n5. 切换当前账号与渠道服")
-        print(
-            f"   切换账号:   {'成功' if accounts.switch_account(account.id) else '失败'}"
-        )
-        print(
-            f"   切换渠道服: {'成功' if servers.switch_server('bserver') else '失败'}"
-        )
+        print(f"   切换账号:   {'成功' if accounts.switch_account(account.id) else '失败'}")
+        print(f"   切换渠道服: {'成功' if servers.switch_server('bserver') else '失败'}")
 
         print("\n6. 读取当前状态")
         current_account = accounts.get_current_account()
         current_server = servers.get_current_server()
-        print(
-            f"   当前账号:   {current_account.username if current_account else '未设置'}"
-        )
+        print(f"   当前账号:   {current_account.username if current_account else '未设置'}")
         print(f"   当前渠道服: {current_server.name if current_server else '未设置'}")
 
         print("\n7. 配置落盘位置（临时目录，退出后自动清理）")
