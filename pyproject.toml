@@ -39,9 +39,6 @@ dependencies = [
     "pyyaml>=6.0.0",
     "httpx>=0.24.0",
     "asyncio-throttle>=1.0.0",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "pytest-cov>=7.1.0",
 ]
 
 [project.optional-dependencies]
@@ -51,8 +48,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
-    "black>=23.0.0",
     "pre-commit>=3.0.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
     "bandit>=1.7.0",
     "safety>=2.3.0",
 ]
@@ -86,7 +84,8 @@ packages = ["src/dwrg_manager"]
 [tool.ruff]
 line-length = 88
 target-version = "py310"
-fix = true
+# 注意：这里刻意不设 `fix = true`，否则 CI 里的 `ruff check` 会静默改写文件却仍退出 0。
+# 本地想自动修复请用 `make fmt`（ruff format + ruff check --fix）。
 
 [tool.ruff.lint]
 select = [
@@ -111,6 +110,7 @@ keep-runtime-typing = true
 
 [tool.mypy]
 python_version = "3.10"
+plugins = ["pydantic.mypy"]
 check_untyped_defs = true
 disallow_any_generics = true
 disallow_incomplete_defs = true
@@ -159,6 +159,8 @@ markers = [
     "performance: Performance tests",
     "slow: Slow tests",
 ]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.coverage.run]
 source = ["src"]

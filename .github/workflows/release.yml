@@ -1,0 +1,81 @@
+# .github/workflows/release.yml
+# 发布：推送 v* 标签时构建 sdist + wheel，校验后上传为构建产物。
+# 默认不发布到 PyPI；如需发布，请启用文件末尾（被注释掉的）publish 作业。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 最小权限：构建作业只需读取仓库内容
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 构建分发包
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装构建工具
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: 构建 sdist 与 wheel
+        run: python -m build
+
+      - name: 校验分发包元数据 (twine check)
+        run: python -m twine check dist/*
+
+      - name: 生成 sha256 校验和
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 可选：发布到 PyPI（Trusted Publishing / OIDC，无需存储 API Token）。
+  #
+  # 启用步骤：
+  #   1) 在 PyPI 项目设置中配置 Trusted Publisher，指向本仓库的 release.yml；
+  #   2) 在仓库 Settings → Environments 中创建名为 pypi 的环境（可选，用于审批）；
+  #   3) 取消下面 publish 作业整段注释。
+  #
+  # 关键点：必须授予 id-token: write 权限，GitHub 会签发 OIDC 令牌，
+  #        pypa/gh-action-pypi-publish 用它换取短期上传凭据，全程无长期密钥。
+  # ---------------------------------------------------------------------------
+  # publish:
+  #   name: 发布到 PyPI
+  #   needs: build
+  #   runs-on: ubuntu-latest
+  #   environment: pypi
+  #   permissions:
+  #     id-token: write   # Trusted Publishing 必需
+  #   steps:
+  #     - name: 下载构建产物
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: dist
+  #         path: dist
+  #
+  #     - name: 通过 Trusted Publishing 上传到 PyPI
+  #       uses: pypa/gh-action-pypi-publish@release/v1

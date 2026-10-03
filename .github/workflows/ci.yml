@@ -1,0 +1,88 @@
+# .github/workflows/ci.yml
+# 持续集成：多 Python 版本 × 多平台矩阵。
+# 质量命令与本地保持一致：
+#   ruff format --check src / ruff check src / mypy src / pytest
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+# 同一分支 / PR 上只保留最新一次运行，自动取消仍在跑的旧任务
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 最小权限：CI 只需读取仓库内容
+permissions:
+  contents: read
+
+jobs:
+  quality-and-test:
+    name: 质量检查与测试 (py${{ matrix.python-version }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 某个矩阵组合失败时不要中断其它组合，方便一次性看到全部问题
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          # 依赖声明集中在 pyproject.toml，用它做缓存键
+          cache-dependency-path: pyproject.toml
+
+      - name: 安装依赖（.[dev]，可编辑安装）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+        # 说明：这里用 -e（editable）而不是普通安装，因为 pytest 配置里是
+        # --cov=src，需要让 dwrg_manager 从源码目录 src/ 被导入，
+        # 否则覆盖率无法映射到源文件。
+
+      # ---- 质量检查仅在 Linux 上执行 --------------------------------------
+      # Windows 作业只跑 pytest，跳过 ruff format / ruff check / mypy：
+      #   1) 这三项都与平台无关，ubuntu 作业已完整覆盖；
+      #   2) 其中 mypy 在 Windows 上尤其慢，跳过可显著缩短矩阵总时长。
+      # 如需在 Windows 上也做 lint/类型检查，删掉下面三个步骤的 if 条件即可。
+
+      - name: 格式检查 (ruff format --check src)
+        if: runner.os != 'Windows'
+        run: ruff format --check src
+
+      - name: 静态检查 (ruff check src)
+        # 注意：pyproject 的 [tool.ruff] 里设置了 fix = true。
+        # 若希望 CI 绝不自动改写文件，可改为：ruff check --no-fix src
+        if: runner.os != 'Windows'
+        run: ruff check src
+
+      - name: 类型检查 (mypy src)
+        if: runner.os != 'Windows'
+        run: mypy src
+
+      # ---- 测试在所有平台上执行 ------------------------------------------
+      - name: 运行测试 (pytest)
+        run: pytest
+
+      - name: 上传覆盖率报告
+        # 即使前面的步骤失败也尝试上传，便于排查
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # 每个矩阵组合使用唯一名称，避免 upload-artifact@v4 的命名冲突
+          name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: ignore
+          retention-days: 7

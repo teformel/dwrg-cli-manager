@@ -1,0 +1,52 @@
+# .pre-commit-config.yaml
+# 提交前自动修复与检查。首次使用：
+#   python -m pip install -e ".[dev]"   # 已包含 pre-commit
+#   pre-commit install
+#   pre-commit run --all-files          # 对全仓库跑一遍
+#
+# 版本说明：下列 rev 为编写时的最新稳定版本；若报 “找不到该版本”，
+# 请按每个 repo 后面的“校准”链接取最新 release/tag 替换。
+
+repos:
+  # ---- Ruff：lint（自动修复） + 格式化 --------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # 校准: https://github.com/astral-sh/ruff-pre-commit/releases
+    rev: v0.16.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # ---- mypy：类型检查（在隔离环境中运行，需显式声明运行时依赖） --------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    # 校准: https://github.com/pre-commit/mirrors-mypy/tags
+    rev: v2.4.0
+    hooks:
+      - id: mypy
+        # 与 CI / Makefile 的 `mypy src` 保持一致，整目录检查而非逐文件检查
+        args: [src]
+        pass_filenames: false
+        additional_dependencies:
+          # pyproject 里启用了 pydantic.mypy 插件，因此必须装上 pydantic
+          - pydantic>=2.0.0
+          - typer>=0.9.0
+          - rich>=13.0.0
+          - click>=8.0.0
+          # 说明：aiohttp / cryptography / psutil / httpx / pyyaml /
+          # python-dotenv 等已在 pyproject 的 [[tool.mypy.overrides]] 里
+          # 设置 ignore_missing_imports，无需在此重复安装。
+
+  # ---- 基础文件卫生 ---------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    # 校准: https://github.com/pre-commit/pre-commit-hooks/releases
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]

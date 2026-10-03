@@ -1,0 +1,68 @@
+# MkDocs Material 站点配置
+# 本文件不引用 mkdocstrings：API 说明以纯 Markdown 手写，避免增加构建期依赖。
+
+site_name: 第五人格命令行管理器
+site_description: 第五人格多渠道服 / 多账号命令行管理工具（dwrg）用户与开发文档
+repo_url: https://github.com/dwrg-team/dwrg-cli-manager
+repo_name: dwrg-team/dwrg-cli-manager
+docs_dir: docs
+use_directory_urls: true
+copyright: MIT License · DWRG Team
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - search.highlight
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+
+nav:
+  - 首页: index.md
+  - 开始使用: getting-started.md
+  - CLI 命令参考: cli-reference.md
+  - 配置: configuration.md
+  - 架构设计: architecture.md
+  - 安全: security.md
+  - 国际化: i18n.md
+  - 插件系统: plugins.md
+  - 资源管理: resources.md
+  - 常见问题排查: troubleshooting.md
+  - 开发指南: development.md
+  - 更新日志: changelog.md

@@ -1,180 +1,334 @@
 """
 配置管理器
+
+负责应用配置的持久化读写与业务级 CRUD。配置文件默认位于
+``~/.config/dwrg/config.yaml``，支持 YAML 与 JSON 两种格式（按扩展名判断）。
+
+设计要点：
+
+* **原子写入**：先写同目录临时文件再 ``os.replace``，避免写入中断导致配置损坏。
+* **字符串友好**：``set_config`` 接受来自命令行的字符串值，依赖 Pydantic
+  的宽松模式自动完成 ``"8" -> 8``、``"true" -> True`` 一类的类型转换。
+* **首次运行自举**：配置文件不存在时写入预置了默认渠道服的初始配置。
 """
 
 import json
 import os
+import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from ..utils.crypto import encrypt_data
+from ..exceptions import ConfigError, ValidationError
+from ..security.crypto import encrypt_data, hash_password
 from ..utils.logger import get_logger
-from .models import AccountConfig, AppConfig, Config, ServerConfig
+from .models import (
+    DEFAULT_SERVER_NAMES,
+    AccountConfig,
+    AppConfig,
+    Config,
+    ServerConfig,
+    default_config,
+)
+
+logger = get_logger(__name__)
+
+#: 可被 :meth:`ConfigManager.set_config` 直接操作的顶层配置项
+SETTABLE_KEYS: tuple[str, ...] = tuple(AppConfig.model_fields)
 
 
-class DateTimeEncoder(json.JSONEncoder):
-    """自定义JSON编码器，支持datetime对象"""
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
+class _DateTimeEncoder(json.JSONEncoder):
+    """支持 ``datetime`` 的 JSON 编码器。"""
+
+    def default(self, o: Any) -> Any:
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return super().default(o)  # pragma: no cover - 由父类抛出 TypeError
+
+
+def default_config_path() -> Path:
+    """返回默认配置文件路径。
+
+    Returns:
+        ``~/.config/dwrg/config.yaml``。
+    """
+    return Path.home() / ".config" / "dwrg" / "config.yaml"
 
 
 class ConfigManager:
-    """配置管理器"""
+    """配置管理器。
 
-    def __init__(self, config_path: str | None = None):
+    Args:
+        config_path: 自定义配置文件路径；为 ``None`` 时使用默认路径。
+        autosave: 是否在每次修改后自动落盘。
+
+    Raises:
+        ConfigError: 配置文件存在但无法解析。
+
+    Example:
+        >>> manager = ConfigManager("/tmp/dwrg-test.yaml")  # doctest: +SKIP
+        >>> manager.get_app_config().language  # doctest: +SKIP
+        'zh-CN'
+    """
+
+    def __init__(
+        self, config_path: str | Path | None = None, *, autosave: bool = True
+    ) -> None:
         self.logger = get_logger(__name__)
-        self.config_path = config_path or self._get_default_config_path()
-        self.config = self._load_config()
+        self.config_path = (
+            Path(config_path).expanduser() if config_path else default_config_path()
+        )
+        self.autosave = autosave
+        self.config: Config = self._load_config()
 
-    def _get_default_config_path(self) -> str:
-        """获取默认配置文件路径"""
-        home_dir = Path.home()
-        config_dir = home_dir / ".config" / "dwrg"
-        config_dir.mkdir(parents=True, exist_ok=True)
-        return str(config_dir / "config.yaml")
-
+    # ------------------------------------------------------------------ #
+    # 读写
+    # ------------------------------------------------------------------ #
     def _load_config(self) -> Config:
-        """加载配置文件"""
-        try:
-            if os.path.exists(self.config_path):
-                with open(self.config_path, encoding='utf-8') as f:
-                    if self.config_path.endswith('.json'):
-                        data = json.load(f)
-                    else:
-                        data = yaml.safe_load(f)
+        """从磁盘加载配置；不存在时创建初始配置。
 
-                self.logger.info(f"加载配置文件: {self.config_path}")
-                return Config(**data)
+        Returns:
+            解析后的 :class:`Config`。
+
+        Raises:
+            ConfigError: 文件存在但内容非法。
+        """
+        if not self.config_path.exists():
+            config = default_config()
+            if self.autosave:
+                try:
+                    self.save_config(config)
+                    self.logger.info("已创建默认配置文件: %s", self.config_path)
+                except ConfigError as exc:  # pragma: no cover - 依赖文件系统
+                    self.logger.warning("初始配置写入失败: %s", exc)
+            return config
+
+        try:
+            text = self.config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError("配置文件读取失败", path=str(self.config_path)) from exc
+
+        try:
+            if self.config_path.suffix.lower() == ".json":
+                data = json.loads(text) if text.strip() else {}
             else:
-                self.logger.info("配置文件不存在，创建默认配置")
-                return Config()
-        except Exception as e:
-            self.logger.error(f"加载配置文件失败: {e}")
-            return Config()
+                data = yaml.safe_load(text) or {}
+        except (json.JSONDecodeError, yaml.YAMLError) as exc:
+            raise ConfigError(
+                "配置文件解析失败", path=str(self.config_path), reason=str(exc)
+            ) from exc
 
-    def save_config(self):
-        """保存配置文件"""
+        if not isinstance(data, dict):
+            raise ConfigError("配置文件根节点必须是映射", path=str(self.config_path))
+
         try:
-            # 确保配置目录存在
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            return Config(**data)
+        except Exception as exc:  # pydantic.ValidationError
+            raise ConfigError(
+                "配置文件内容不合法", path=str(self.config_path), reason=str(exc)
+            ) from exc
 
-            # 转换为字典
-            config_dict = self.config.dict()
+    def save_config(self, config: Config | None = None) -> Path:
+        """原子写入配置文件。
 
-            # 保存到文件
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                if self.config_path.endswith('.json'):
-                    json.dump(config_dict, f, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
-                else:
-                    yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True)
+        Args:
+            config: 待保存的配置；为 ``None`` 时保存当前内存中的配置。
 
-            self.logger.info(f"保存配置文件: {self.config_path}")
-        except Exception as e:
-            self.logger.error(f"保存配置文件失败: {e}")
-            raise
+        Returns:
+            写入的文件路径。
 
-    def get_config(self) -> Config:
-        """获取配置对象"""
+        Raises:
+            ConfigError: 写入失败。
+        """
+        target = self.config_path
+        payload = (config or self.config).to_dict()
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        is_json = target.suffix.lower() == ".json"
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=target.name + ".", suffix=".tmp", dir=str(target.parent)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    if is_json:
+                        json.dump(
+                            payload,
+                            fh,
+                            indent=2,
+                            ensure_ascii=False,
+                            cls=_DateTimeEncoder,
+                        )
+                    else:
+                        yaml.safe_dump(
+                            payload, fh, default_flow_style=False, allow_unicode=True
+                        )
+                os.replace(tmp_name, target)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:  # pragma: no cover - 尽力而为
+                    pass
+                raise
+        except OSError as exc:
+            raise ConfigError(
+                "配置文件写入失败", path=str(target), reason=str(exc)
+            ) from exc
+
+        self.logger.debug("保存配置文件: %s", target)
+        return target
+
+    def reload(self) -> Config:
+        """从磁盘重新加载配置。
+
+        Returns:
+            重新加载后的 :class:`Config`。
+        """
+        self.config = self._load_config()
         return self.config
 
+    # ------------------------------------------------------------------ #
+    # 访问器
+    # ------------------------------------------------------------------ #
+    def get_config(self) -> Config:
+        """获取当前配置对象。
+
+        Returns:
+            :class:`Config` 实例。
+        """
+        return self.config
+
+    def get_config_dict(self) -> dict[str, Any]:
+        """获取当前配置的纯字典形式（供 CLI 展示/导出）。
+
+        Returns:
+            可 JSON 序列化的字典。
+        """
+        return self.config.to_dict()
+
     def get_app_config(self) -> AppConfig:
-        """获取应用配置"""
+        """获取应用级配置。
+
+        Returns:
+            :class:`AppConfig` 实例。
+        """
         return self.config.app
 
     def get_server_config(self, name: str) -> ServerConfig | None:
-        """获取服务器配置"""
+        """获取指定渠道服配置。
+
+        Args:
+            name: 渠道服名称。
+
+        Returns:
+            渠道服配置；不存在时返回 ``None``。
+        """
         return self.config.get_server(name)
 
     def get_account_config(self, account_id: str) -> AccountConfig | None:
-        """获取账号配置"""
+        """获取指定账号配置。
+
+        Args:
+            account_id: 账号 ID。
+
+        Returns:
+            账号配置；不存在时返回 ``None``。
+        """
         return self.config.get_account(account_id)
 
     def get_current_server(self) -> ServerConfig | None:
-        """获取当前服务器配置"""
+        """获取当前默认渠道服配置。
+
+        Returns:
+            渠道服配置；未设置时返回 ``None``。
+        """
         return self.config.get_current_server()
 
     def get_current_account(self) -> AccountConfig | None:
-        """获取当前账号配置"""
+        """获取当前账号配置。
+
+        Returns:
+            账号配置；未设置时返回 ``None``。
+        """
         return self.config.get_current_account()
 
-    def set_config(self, key: str, value: Any):
-        """设置配置项"""
+    # ------------------------------------------------------------------ #
+    # 应用配置项
+    # ------------------------------------------------------------------ #
+    def set_config(self, key: str, value: Any) -> None:
+        """设置应用级配置项。
+
+        Args:
+            key: 配置键，支持 ``log_level`` 或 ``app.log_level`` 两种写法。
+            value: 配置值；通常来自命令行，因此可能是字符串
+                （例如 ``"8"`` / ``"true"``），由 Pydantic 宽松模式转换。
+
+        Raises:
+            ConfigError: 键不存在或取值不合法。
+        """
+        field = key.split(".", 1)[1] if key.startswith("app.") else key
+        if field not in SETTABLE_KEYS:
+            raise ConfigError(
+                f"不支持的配置项: {key}，可用: {', '.join(SETTABLE_KEYS)}", key=key
+            )
         try:
-            if key == "server":
-                self.config.app.server = value
-            elif key == "account":
-                self.config.app.account = value
-            elif key == "auto_update":
-                self.config.app.auto_update = value
-            elif key == "verbose":
-                self.config.app.verbose = value
-            elif key == "language":
-                self.config.app.language = value
-            elif key == "data_dir":
-                self.config.app.data_dir = value
-            elif key == "cache_dir":
-                self.config.app.cache_dir = value
-            elif key == "log_level":
-                self.config.app.log_level = value
-            elif key == "max_concurrent_downloads":
-                self.config.app.max_concurrent_downloads = value
-            elif key == "download_timeout":
-                self.config.app.download_timeout = value
-            else:
-                # 尝试设置嵌套配置
-                keys = key.split('.')
-                if len(keys) == 2 and keys[0] == 'app':
-                    setattr(self.config.app, keys[1], value)
-                else:
-                    raise ValueError(f"不支持的配置项: {key}")
+            setattr(self.config.app, field, value)
+        except Exception as exc:  # pydantic.ValidationError
+            raise ConfigError(f"配置项 {key} 取值不合法", key=key, value=value) from exc
 
+        if self.autosave:
             self.save_config()
-            self.logger.info(f"设置配置: {key} = {value}")
-        except Exception as e:
-            self.logger.error(f"设置配置失败: {e}")
-            raise
+        self.logger.info("设置配置: %s = %r", key, value)
 
-    def unset_config(self, key: str):
-        """删除配置项"""
-        try:
-            if key == "server":
-                self.config.app.server = "official"
-            elif key == "account":
-                self.config.app.account = None
-            elif key == "auto_update":
-                self.config.app.auto_update = True
-            elif key == "verbose":
-                self.config.app.verbose = False
-            elif key == "language":
-                self.config.app.language = "zh-CN"
-            elif key == "data_dir":
-                self.config.app.data_dir = "~/.dwrg"
-            elif key == "cache_dir":
-                self.config.app.cache_dir = "~/.dwrg/cache"
-            elif key == "log_level":
-                self.config.app.log_level = "INFO"
-            elif key == "max_concurrent_downloads":
-                self.config.app.max_concurrent_downloads = 5
-            elif key == "download_timeout":
-                self.config.app.download_timeout = 300
-            else:
-                raise ValueError(f"不支持的配置项: {key}")
+    def unset_config(self, key: str) -> None:
+        """把一个配置项恢复为默认值。
 
+        Args:
+            key: 配置键。
+
+        Raises:
+            ConfigError: 键不存在。
+        """
+        field = key.split(".", 1)[1] if key.startswith("app.") else key
+        if field not in SETTABLE_KEYS:
+            raise ConfigError(f"不支持的配置项: {key}", key=key)
+        defaults = AppConfig()
+        setattr(self.config.app, field, getattr(defaults, field))
+        if self.autosave:
             self.save_config()
-            self.logger.info(f"删除配置: {key}")
-        except Exception as e:
-            self.logger.error(f"删除配置失败: {e}")
-            raise
+        self.logger.info("重置配置: %s", key)
 
-    def add_server(self, name: str, endpoint: str, region: str = "CN",
-                  status: str = "active", version: str = "1.0.0",
-                  is_default: bool = False) -> ServerConfig:
-        """添加服务器配置"""
+    # ------------------------------------------------------------------ #
+    # 渠道服 CRUD
+    # ------------------------------------------------------------------ #
+    def add_server(
+        self,
+        name: str,
+        endpoint: str = "",
+        region: str = "CN",
+        status: str = "active",
+        version: str = "1.0.0",
+        is_default: bool = False,
+    ) -> ServerConfig:
+        """新增渠道服配置。
+
+        Args:
+            name: 渠道服名称。
+            endpoint: 接口地址。
+            region: 地区。
+            status: 状态。
+            version: 版本号。
+            is_default: 是否设为默认渠道服。
+
+        Returns:
+            新建的 :class:`ServerConfig`。
+
+        Raises:
+            ConfigError: 名称为空或状态非法。
+        """
         try:
             server = ServerConfig(
                 name=name,
@@ -182,154 +336,274 @@ class ConfigManager:
                 region=region,
                 status=status,
                 version=version,
-                is_default=is_default
+                is_default=is_default,
             )
+        except Exception as exc:  # pydantic.ValidationError
+            raise ConfigError(f"渠道服配置不合法: {name}", name=name) from exc
 
-            self.config.add_server(server)
-
-            # 如果设置为默认服务器，更新其他服务器
-            if is_default:
-                for srv_name, srv_config in self.config.servers.items():
-                    srv_config.is_default = (srv_name == name)
-
+        self.config.add_server(server)
+        if is_default:
+            self._mark_default_server(name)
+        if self.autosave:
             self.save_config()
-            self.logger.info(f"添加服务器: {name}")
-            return server
-        except Exception as e:
-            self.logger.error(f"添加服务器失败: {e}")
-            raise
+        self.logger.info("添加渠道服: %s", name)
+        return server
 
     def remove_server(self, name: str) -> bool:
-        """删除服务器配置"""
-        try:
-            success = self.config.remove_server(name)
-            if success:
-                # 如果删除的是当前服务器，重置为官方服
-                if self.config.app.server == name:
-                    self.config.app.server = "official"
+        """删除渠道服配置。
+
+        Args:
+            name: 渠道服名称。
+
+        Returns:
+            是否删除成功。
+        """
+        removed = self.config.remove_server(name)
+        if removed:
+            if self.config.app.server == name:
+                remaining = sorted(self.config.servers)
+                self.config.app.server = remaining[0] if remaining else ""
+            if self.autosave:
                 self.save_config()
-                self.logger.info(f"删除服务器: {name}")
-            return success
-        except Exception as e:
-            self.logger.error(f"删除服务器失败: {e}")
-            raise
+            self.logger.info("删除渠道服: %s", name)
+        return removed
 
-    def add_account(self, username: str, server: str, password: str,
-                   account_id: str | None = None) -> AccountConfig:
-        """添加账号配置"""
+    def set_default_server(self, name: str) -> None:
+        """把指定渠道服设为默认（即「当前渠道服」）。
+
+        Args:
+            name: 渠道服名称。
+
+        Raises:
+            ConfigError: 渠道服不存在。
+        """
+        if name not in self.config.servers:
+            raise ConfigError(
+                f"渠道服不存在: {name}，可用: {', '.join(sorted(self.config.servers)) or '（无）'}",
+                name=name,
+            )
+        self._mark_default_server(name)
+        if self.autosave:
+            self.save_config()
+        self.logger.info("切换默认渠道服: %s", name)
+
+    def _mark_default_server(self, name: str) -> None:
+        """更新所有渠道服的默认标记与 ``app.server``。
+
+        Args:
+            name: 目标渠道服名称。
+        """
+        for server_name, server in self.config.servers.items():
+            server.is_default = server_name == name
+        self.config.app.server = name
+
+    # ------------------------------------------------------------------ #
+    # 账号 CRUD
+    # ------------------------------------------------------------------ #
+    def add_account(
+        self,
+        username: str,
+        server: str,
+        password: str,
+        account_id: str | None = None,
+    ) -> AccountConfig:
+        """新增账号配置（密码同时以密文与哈希两种形式存储）。
+
+        Args:
+            username: 用户名。
+            server: 所属渠道服。
+            password: 明文密码。
+            account_id: 指定账号 ID；为 ``None`` 时自动生成 UUID。
+
+        Returns:
+            新建的 :class:`AccountConfig`。
+
+        Raises:
+            ConfigError: 参数不合法。
+        """
+        new_id = account_id or str(uuid.uuid4())
         try:
-            # 生成账号ID
-            if not account_id:
-                import uuid
-                account_id = str(uuid.uuid4())
-
-            # 加密密码
-            encrypted_password = encrypt_data(password)
-
-            # 创建账号配置
             account = AccountConfig(
-                id=account_id,
+                id=new_id,
                 username=username,
                 server=server,
-                encrypted_password=encrypted_password,
-                last_login=datetime.now(),
-                is_current=False
+                encrypted_password=encrypt_data(password),
+                password_hash=hash_password(password),
+                created_at=datetime.now(),
+                last_login=None,
+                is_current=False,
             )
-
-            self.config.add_account(account)
-            self.save_config()
-            self.logger.info(f"添加账号: {username} ({account_id})")
-            return account
-        except Exception as e:
-            self.logger.error(f"添加账号失败: {e}")
+        except ValidationError:
             raise
+        except Exception as exc:  # pydantic.ValidationError
+            raise ConfigError("账号配置不合法", username=username) from exc
+
+        self.config.add_account(account)
+        if self.autosave:
+            self.save_config()
+        self.logger.info("添加账号: %s (%s)", username, new_id)
+        return account
+
+    def save_account(self, account: AccountConfig) -> None:
+        """写回一个已存在的账号配置。
+
+        Args:
+            account: 账号配置对象。
+        """
+        self.config.add_account(account)
+        if self.autosave:
+            self.save_config()
 
     def remove_account(self, account_id: str) -> bool:
-        """删除账号配置"""
-        try:
-            success = self.config.remove_account(account_id)
-            if success:
-                # 如果删除的是当前账号，重置
-                if self.config.app.account == account_id:
-                    self.config.app.account = None
+        """删除账号配置。
+
+        Args:
+            account_id: 账号 ID。
+
+        Returns:
+            是否删除成功。
+        """
+        removed = self.config.remove_account(account_id)
+        if removed:
+            if self.config.app.account == account_id:
+                self.config.app.account = None
+            if self.autosave:
                 self.save_config()
-                self.logger.info(f"删除账号: {account_id}")
-            return success
-        except Exception as e:
-            self.logger.error(f"删除账号失败: {e}")
-            raise
+            self.logger.info("删除账号: %s", account_id)
+        return removed
 
     def switch_account(self, account_id: str) -> bool:
-        """切换当前账号"""
-        try:
-            # 重置所有账号的当前状态
-            for acc in self.config.accounts.values():
-                acc.is_current = (acc.id == account_id)
+        """把指定账号设为当前账号。
 
-            self.config.app.account = account_id
-            self.save_config()
-            self.logger.info(f"切换账号: {account_id}")
-            return True
-        except Exception as e:
-            self.logger.error(f"切换账号失败: {e}")
+        Args:
+            account_id: 账号 ID。
+
+        Returns:
+            是否切换成功。
+        """
+        if account_id not in self.config.accounts:
+            self.logger.error("账号不存在: %s", account_id)
             return False
-
-    def switch_server(self, server_name: str) -> bool:
-        """切换当前服务器"""
-        try:
-            # 重置所有服务器的默认状态
-            for srv in self.config.servers.values():
-                srv.is_default = (srv.name == server_name)
-
-            self.config.app.server = server_name
+        for acc in self.config.accounts.values():
+            acc.is_current = acc.id == account_id
+        self.config.app.account = account_id
+        if self.autosave:
             self.save_config()
-            self.logger.info(f"切换服务器: {server_name}")
-            return True
-        except Exception as e:
-            self.logger.error(f"切换服务器失败: {e}")
-            return False
+        self.logger.info("切换账号: %s", account_id)
+        return True
 
-    def list_servers(self) -> list:
-        """列出所有服务器"""
-        return list(self.config.servers.values())
+    def list_servers(self) -> list[ServerConfig]:
+        """列出全部渠道服。
 
-    def list_accounts(self, server: str | None = None) -> list:
-        """列出所有账号"""
-        accounts = list(self.config.accounts.values())
+        Returns:
+            按名称排序的渠道服列表。
+        """
+        return [self.config.servers[k] for k in sorted(self.config.servers)]
+
+    def list_accounts(self, server: str | None = None) -> list[AccountConfig]:
+        """列出账号。
+
+        Args:
+            server: 仅返回该渠道服下的账号；为 ``None`` 时返回全部。
+
+        Returns:
+            账号配置列表。
+        """
+        accounts = [self.config.accounts[k] for k in sorted(self.config.accounts)]
         if server:
             accounts = [acc for acc in accounts if acc.server == server]
         return accounts
 
-    def export_config(self, export_path: str, format: str = "yaml") -> bool:
-        """导出配置"""
+    # ------------------------------------------------------------------ #
+    # 导入导出
+    # ------------------------------------------------------------------ #
+    def export_config(self, export_path: str | Path, fmt: str = "yaml") -> Path:
+        """导出配置到文件。
+
+        Args:
+            export_path: 目标文件路径。
+            fmt: 导出格式，``yaml`` 或 ``json``。
+
+        Returns:
+            实际写入的路径。
+
+        Raises:
+            ConfigError: 格式不支持或写入失败。
+        """
+        target = Path(export_path).expanduser()
+        payload = self.config.to_dict()
         try:
-            config_dict = self.config.dict()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if fmt == "json":
+                target.write_text(
+                    json.dumps(
+                        payload, indent=2, ensure_ascii=False, cls=_DateTimeEncoder
+                    ),
+                    encoding="utf-8",
+                )
+            elif fmt == "yaml":
+                with open(target, "w", encoding="utf-8") as fh:
+                    yaml.safe_dump(
+                        payload, fh, default_flow_style=False, allow_unicode=True
+                    )
+            else:
+                raise ConfigError(f"不支持的导出格式: {fmt}", format=fmt)
+        except OSError as exc:
+            raise ConfigError(
+                "导出配置失败", path=str(target), reason=str(exc)
+            ) from exc
+        self.logger.info("导出配置到: %s", target)
+        return target
 
-            with open(export_path, 'w', encoding='utf-8') as f:
-                if format == "json":
-                    json.dump(config_dict, f, indent=2, ensure_ascii=False)
-                else:
-                    yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True)
+    def import_config(self, import_path: str | Path) -> Config:
+        """从文件导入配置并覆盖当前配置。
 
-            self.logger.info(f"导出配置到: {export_path}")
-            return True
-        except Exception as e:
-            self.logger.error(f"导出配置失败: {e}")
-            return False
+        Args:
+            import_path: 源文件路径。
 
-    def import_config(self, import_path: str) -> bool:
-        """导入配置"""
+        Returns:
+            导入后的 :class:`Config`。
+
+        Raises:
+            ConfigError: 文件不存在或内容非法。
+        """
+        source = Path(import_path).expanduser()
+        if not source.exists():
+            raise ConfigError(f"待导入的配置文件不存在: {source}", path=str(source))
+        previous = self.config_path
+        self.config_path = source
         try:
-            with open(import_path, encoding='utf-8') as f:
-                if import_path.endswith('.json'):
-                    data = json.load(f)
-                else:
-                    data = yaml.safe_load(f)
-
-            self.config = Config(**data)
+            imported = self._load_config()
+        finally:
+            self.config_path = previous
+        self.config = imported
+        if self.autosave:
             self.save_config()
-            self.logger.info(f"导入配置从: {import_path}")
-            return True
-        except Exception as e:
-            self.logger.error(f"导入配置失败: {e}")
-            return False
+        self.logger.info("已从 %s 导入配置", source)
+        return imported
+
+    def ensure_default_servers(self) -> int:
+        """补齐缺失的默认渠道服。
+
+        Returns:
+            新增的渠道服数量。
+        """
+        added = 0
+        for name, server in default_config().servers.items():
+            if name not in self.config.servers:
+                self.config.add_server(server)
+                added += 1
+        if added and self.autosave:
+            self.save_config()
+        return added
+
+    def get_default_server_names(self) -> tuple[str, ...]:
+        """返回内置的渠道服名称。
+
+        Returns:
+            默认渠道服名称元组。
+        """
+        return DEFAULT_SERVER_NAMES
+
+
+__all__ = ["SETTABLE_KEYS", "ConfigManager", "default_config_path"]

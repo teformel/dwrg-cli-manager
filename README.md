@@ -1,373 +1,151 @@
 # 第五人格命令行管理器
 
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+<!-- 徽章占位：替换为你的仓库地址后即可生效 -->
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![CI](https://github.com/dwrg-team/dwrg-cli-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/dwrg-team/dwrg-cli-manager/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-90%2B-brightgreen.svg)](https://github.com/dwrg-team/dwrg-cli-manager/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/badge/ci-pending-lightgrey.svg)](#)
+[![Coverage](https://img.shields.io/badge/coverage-pending-lightgrey.svg)](#)
 
-一个功能强大的第五人格游戏命令行管理工具，支持多渠道服管理和多账号管理。
+> 一个用命令行管理第五人格多渠道服与多账号的工具，命令名为 `dwrg`。
 
-## 🚀 特性
+<!-- 截图占位：将真实截图放入 docs/assets/ 后取消下一行注释 -->
+<!-- ![dwrg help 界面](docs/assets/screenshot.png) -->
 
-- 🎮 **多渠道服管理**: 支持官方服、B服等多种渠道服切换
-- 👥 **多账号管理**: 支持多个游戏账号的创建、切换和管理
-- 📦 **资源管理**: 自动下载和更新游戏资源
-- 🔒 **安全可靠**: 加密存储账号信息，确保数据安全
-- 🌍 **国际化支持**: 支持中文、英文等多种语言
-- 🔌 **插件系统**: 可扩展的插件架构，支持第三方开发
-- ⚡ **高性能**: 异步处理，快速响应
-- 🎨 **用户友好**: 美观的命令行界面，清晰的操作提示
-
-## 📦 安装
-
-### 使用 pip 安装
+## 安装
 
 ```bash
-pip install dwrg-cli-manager
-```
+# 推荐：pipx（隔离环境）
+pipx install dwrg-cli-manager
 
-### 使用源码安装
+# 或：uv
+uv tool install dwrg-cli-manager
 
-```bash
+# 或：源码 + venv
 git clone https://github.com/dwrg-team/dwrg-cli-manager.git
 cd dwrg-cli-manager
-pip install -e .
-```
-
-### 使用 uv 安装（推荐）
-
-```bash
-uv add dwrg-cli-manager
-```
-
-## 🛠️ 使用
-
-### 基础命令
-
-```bash
-# 显示版本信息
-dwrg --version
-
-# 显示帮助信息
-dwrg --help
-
-# 显示详细帮助
-dwrg help <command>
-```
-
-### 账号管理
-
-```bash
-# 添加账号
-dwrg account add --username <用户名> --password <密码> [--server <渠道服>]
-
-# 列出所有账号
-dwrg account list [--server <渠道服>] [--format <格式>]
-
-# 切换当前账号
-dwrg account switch <账号ID>
-
-# 删除账号
-dwrg account remove <账号ID>
-
-# 显示账号状态
-dwrg account status <账号ID>
-
-# 账号登录
-dwrg account login <账号ID>
-
-# 账号登出
-dwrg account logout
-```
-
-### 渠道服管理
-
-```bash
-# 列出所有渠道服
-dwrg server list [--format <格式>]
-
-# 显示当前渠道服
-dwrg server current
-
-# 检测渠道服状态
-dwrg server detect
-
-# 切换渠道服
-dwrg server switch <渠道服名称> [--force]
-
-# 显示渠道服信息
-dwrg server show <渠道服名称>
-
-# 设置默认渠道服
-dwrg server set-default <渠道服名称>
-```
-
-### 资源管理
-
-```bash
-# 检查游戏文件完整性
-dwrg resource check [--server <渠道服>]
-
-# 更新游戏资源
-dwrg resource update [--server <渠道服>] [--force]
-
-# 清理缓存
-dwrg resource clean [--all]
-
-# 显示缓存信息
-dwrg resource info [--server <渠道服>]
-
-# 验证游戏文件
-dwrg resource verify [--server <渠道服>]
-```
-
-### 启动管理
-
-```bash
-# 启动游戏
-dwrg launch [--account <账号ID>] [--server <渠道服>] [--verbose]
-
-# 启动诊断
-dwrg diagnose [--output <文件>]
-
-# 显示启动状态
-dwrg status
-
-# 停止游戏进程
-dwrg stop [--force]
-```
-
-### 配置管理
-
-```bash
-# 显示配置
-dwrg config show [--key <键>] [--format <格式>]
-
-# 设置配置值
-dwrg config set <键> <值>
-
-# 删除配置项
-dwrg config unset <键>
-
-# 重置配置
-dwrg config reset [--all]
-
-# 导出配置
-dwrg config export [--output <文件>] [--format <格式>]
-
-# 导入配置
-dwrg config import [--input <文件>] [--format <格式>]
-```
-
-## 📋 输出格式
-
-### 默认格式（人类可读）
-
-```bash
-$ dwrg server list
-官方服    active    1.0.0    CN
-B服      active    1.0.0    CN
-测试服   inactive  1.0.0    CN
-```
-
-### JSON 格式（机器可解析）
-
-```bash
-$ dwrg server list --format json
-{
-  "servers": [
-    {
-      "name": "官方服",
-      "status": "active",
-      "version": "1.0.0",
-      "region": "CN"
-    },
-    {
-      "name": "B服",
-      "status": "active", 
-      "version": "1.0.0",
-      "region": "CN"
-    }
-  ]
-}
-```
-
-### 表格格式（清晰易读）
-
-```bash
-$ dwrg account list --format table
-+----------+-----------+---------+---------------------+
-| 账号ID   | 用户名    | 渠道服  | 最后登录时间        |
-+----------+-----------+---------+---------------------+
-| acc123   | player1   | 官方服  | 2026-09-21 10:30:00 |
-| acc456   | player2   | B服     | 2026-09-21 09:15:00 |
-+----------+-----------+---------+---------------------+
-```
-
-## 🔧 配置
-
-### 配置文件位置
-
-- **全局配置**: `~/.config/dwrg/config`
-- **项目配置**: `./.dwrg/config`
-- **环境变量**: `DWRG_SERVER`, `DWRG_ACCOUNT`
-
-### 配置示例
-
-```yaml
-# ~/.config/dwrg/config
-server: official
-account: acc123
-auto_update: true
-verbose: false
-```
-
-## 🌍 国际化
-
-支持以下语言：
-- 🇨🇳 简体中文 (zh-CN)
-- 🇹🇼 繁体中文 (zh-TW)  
-- 🇺🇸 英语 (en-US)
-- 🇯🇵 日语 (ja-JP)
-- 🇰🇷 韩语 (ko-KR)
-- 🇫🇷 法语 (fr-FR)
-- 🇩🇪 德语 (de-DE)
-- 🇪🇸 西班牙语 (es-ES)
-- 🇷🇺 俄语 (ru-RU)
-
-```bash
-# 设置语言
-export DWRG_LANG=zh-CN
-```
-
-## 🔌 插件系统
-
-### 安装插件
-
-```bash
-# 安装插件
-dwrg plugin install /path/to/plugin.tar.gz
-
-# 列出插件
-dwrg plugin list
-
-# 启用插件
-dwrg plugin enable <插件名称>
-
-# 禁用插件
-dwrg plugin disable <插件名称>
-```
-
-### 开发插件
-
-参考 [插件开发文档](docs/plugin-development.md)
-
-## 🏗️ 项目结构
-
-```
-dwrg-cli-manager/
-├── src/
-│   └── dwrg_manager/
-│       ├── __init__.py
-│       ├── main.py                 # 主入口
-│       ├── cli.py                  # CLI命令定义
-│       ├── config/                 # 配置管理
-│       ├── accounts/               # 账号管理
-│       ├── servers/                # 渠道服管理
-│       ├── resources/              # 资源管理
-│       ├── launcher/               # 启动管理
-│       ├── utils/                  # 工具函数
-│       ├── plugins/                # 插件系统
-│       ├── i18n/                   # 国际化
-│       └── security/               # 安全模块
-├── tests/                         # 测试文件
-├── docs/                          # 文档
-├── scripts/                       # 脚本
-├── pyproject.toml                 # 项目配置
-├── README.md                      # 项目说明
-└── LICENSE                        # 许可证
-```
-
-## 🧪 开发
-
-### 环境设置
-
-```bash
-# 克隆仓库
-git clone https://github.com/dwrg-team/dwrg-cli-manager.git
-cd dwrg-cli-manager
-
-# 创建虚拟环境
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate     # Windows
-
-# 安装开发依赖
+source venv/bin/activate        # Windows：venv\Scripts\activate
 pip install -e ".[dev]"
-
-# 安装 pre-commit 钩子
-pre-commit install
 ```
 
-### 运行测试
+要求 Python 3.10 或更高版本。详见 [开始使用](docs/getting-started.md)。
+
+## 快速开始
 
 ```bash
-# 运行所有测试
-pytest
-
-# 运行特定测试
-pytest tests/test_accounts.py
-
-# 运行覆盖率测试
-pytest --cov=src
-
-# 运行性能测试
-pytest tests/performance/
+dwrg --version
 ```
 
-### 代码格式化
+```text
+DWRG CLI Manager 1.0.0
+```
 
 ```bash
-# 格式化代码
-ruff check .
-ruff format .
-
-# 类型检查
-mypy src/
-
-# 安全检查
-bandit -r src/
-safety check
+dwrg help
 ```
 
-## 🤝 贡献
+```text
+可用命令
+ account   账号管理
+ server    渠道服管理
+ resource  资源管理
+ launch    启动管理
+ config    配置管理
+ plugin    插件管理
+ diagnose  系统诊断
+ status    状态检查
+```
 
-欢迎贡献代码！请阅读 [贡献指南](CONTRIBUTING.md) 了解详情。
+```bash
+dwrg account add --username tester --server official
+```
 
-### 开发流程
+```text
+Password:
+✓ 账号添加成功: tester (3f1c2ab9...)
+```
 
-1. Fork 项目
-2. 创建功能分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 创建 Pull Request
+```bash
+dwrg status
+```
 
-## 📄 许可证
+```text
+ 项目          值
+ 版本          1.0.0
+ 配置文件      /home/<user>/.config/dwrg/config.yaml
+ 当前渠道服    official (1.0.0)
+ 当前账号      tester (3f1c2ab9...)
+ 渠道服数量    3
+ 账号数量      1
+! 游戏未运行
+```
 
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+## 特性
 
-## 🙏 致谢
+| 能力 | 说明 |
+|------|------|
+| 多渠道服 | 内置 `official` / `bserver` / `test_server`，支持新增、删除、切换、设默认与并发延迟探测 |
+| 多账号 | 创建、列出、切换、删除、登录 / 登出；密码以密文 + 哈希双形式存储 |
+| 资源管理 | 完整性检查、增量更新、缓存统计与清理；并发下载与断点续传 |
+| 启动管理 | 路径解析、启动参数与环境组装、停止进程、运行状态查询 |
+| 配置管理 | YAML / JSON 双格式；查看、设置、重置、导出、导入；原子写入 |
+| 插件系统 | 目录 / 单文件布局动态加载 `Plugin` 子类，启用状态持久化 |
+| 国际化 | 9 种语言代码，点号键目录与回退链，日期时间本地化 |
+| 安全 | Fernet 密钥文件（`0600`）、PBKDF2-HMAC-SHA256 哈希、集中式输入校验 |
+| 可观测性 | Rich 表格 / 面板、`--format json`、滚动日志、`diagnose` 诊断报告 |
 
-感谢所有贡献者和支持者！
+## 命令总览
 
-## 📞 支持
+| 命令 | 子命令 |
+|------|--------|
+| `dwrg help` | — |
+| `dwrg diagnose` | — |
+| `dwrg status` | — |
+| `dwrg account` | `add` `list` `switch` `remove` `status` `login` `logout` |
+| `dwrg server` | `list` `current` `detect` `switch` `show` `info` `add` `remove` `set-default` |
+| `dwrg resource` | `check` `verify` `update` `clean` `info` |
+| `dwrg launch` | `start` `stop` `status`（不带子命令时等同 `start`） |
+| `dwrg config` | `show` `set` `unset` `reset` `export` `import` |
+| `dwrg plugin` | `list` `info` `enable` `disable` |
 
-- 📧 邮箱: team@dwrg.com
-- 💬 讨论: [GitHub Discussions](https://github.com/dwrg-team/dwrg-cli-manager/discussions)
-- 🐛 问题报告: [GitHub Issues](https://github.com/dwrg-team/dwrg-cli-manager/issues)
+全局选项：`--version/-V`、`--verbose/-v`、`--lang`。子命令普遍支持 `--config`（`plugin` 子命令用 `--plugin-dir`）。完整说明见 [CLI 命令参考](docs/cli-reference.md)。
 
-## 🌟 Star History
+## 文档索引
 
-如果这个项目对你有帮助，请给我们一个 star ⭐
+| 文档 | 内容 |
+|------|------|
+| [开始使用](docs/getting-started.md) | 安装、首次运行、验证、卸载、常见问题 |
+| [CLI 命令参考](docs/cli-reference.md) | 逐个命令的语法、选项、参数、示例与退出码 |
+| [配置](docs/configuration.md) | 配置位置、格式、完整配置项表、环境变量 |
+| [架构设计](docs/architecture.md) | 分层架构、模块职责、数据流与设计决策 |
+| [安全](docs/security.md) | 密钥管理、密码哈希、校验规则、威胁模型 |
+| [国际化](docs/i18n.md) | 语言切换、目录结构、`t()` 用法、新增语言 |
+| [插件系统](docs/plugins.md) | 目录结构、`Plugin` 生命周期、开发示例 |
+| [资源管理](docs/resources.md) | 下载 / 校验 / 打补丁流程、缓存、并发与续传 |
+| [常见问题排查](docs/troubleshooting.md) | 常见错误信息 → 原因 → 解决 |
+| [开发指南](docs/development.md) | 开发环境、质量命令、提交规范、新增命令 |
+| [更新日志](docs/changelog.md) | Keep a Changelog 格式 |
 
-[![Star History Chart](https://api.star-history.com/svg?repos=dwrg-team/dwrg-cli-manager&type=Date)](https://star-history.com/#dwrg-team/dwrg-cli-manager&Date)
+## 开发
+
+```bash
+uv sync
+
+uv run ruff format .
+uv run ruff check .
+uv run mypy src/
+uv run pytest
+```
+
+本地预览文档（需安装 `docs` 可选依赖）：
+
+```bash
+pip install -e ".[docs]"
+mkdocs serve
+```
+
+贡献流程与代码规范见 [开发指南](docs/development.md)，行为准则见仓库根目录 `CONTRIBUTING.md`。
+
+## 许可证
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。

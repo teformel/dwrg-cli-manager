@@ -1,62 +1,134 @@
 """
 资源管理器
+
+作为资源领域的唯一对外入口，``ResourceManager`` 只负责「装配」：
+选择服务器、获取清单、调用 :class:`~dwrg_manager.resources.validator.Validator`
+做文件体检、调用 :class:`~dwrg_manager.resources.patcher.Patcher` 做增量更新，
+并对外暴露缓存统计与清理。真正的下载/校验/比对逻辑分别位于
+``downloader`` / ``validator`` / ``patcher`` 三个子模块。
 """
 
-import asyncio
-import hashlib
-import json
+import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 
 from ..config.manager import ConfigManager
 from ..utils.logger import get_logger
-from ..utils.system import SystemManager
+from .downloader import Downloader
 from .models import (
+    ManifestTransport,
+    PatchPlan,
     ResourceCheckResult,
     ResourceFile,
     ResourceManifest,
     ResourceServer,
     ResourceUpdateResult,
 )
+from .patcher import Patcher
+from .validator import Validator
 
 logger = get_logger(__name__)
 
 
+class AiohttpManifestTransport:
+    """基于 aiohttp 的默认清单提供者。"""
+
+    def __init__(self, timeout: int = 30) -> None:
+        """初始化传输层。
+
+        Args:
+            timeout: 获取清单的请求总超时（秒）。
+        """
+        self._timeout = timeout
+
+    async def fetch_manifest(self, server: ResourceServer) -> ResourceManifest | None:
+        """从服务器的 ``manifest.json`` 拉取并解析清单。
+
+        Args:
+            server: 目标资源服务器。
+
+        Returns:
+            解析成功返回 :class:`ResourceManifest`，失败返回 ``None``。
+        """
+        url = f"{server.base_url.rstrip('/')}/manifest.json"
+        timeout = aiohttp.ClientTimeout(total=self._timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.error("获取清单失败: HTTP %s (%s)", response.status, url)
+                        return None
+                    data = await response.json()
+        except Exception as exc:  # noqa: BLE001 - 网络边界，统一降级为 None
+            logger.error("获取清单异常: %s (%s)", exc, url)
+            return None
+        try:
+            return ResourceManifest(**data)
+        except ValueError as exc:
+            logger.error("解析清单失败: %s", exc)
+            return None
+
+
 class ResourceManager:
-    """资源管理器"""
+    """资源管理器，编排校验 / 下载 / 补丁三个子模块。"""
 
-    def __init__(self):
-        self.config_manager = ConfigManager()
-        self.system_manager = SystemManager()
-        self.data_dir = Path.home() / '.dwrg' / 'data'
-        self.cache_dir = Path.home() / '.dwrg' / 'cache'
-        self.game_dir = Path.home() / '.dwrg' / 'game'
+    def __init__(
+        self,
+        config_manager: ConfigManager | None = None,
+        *,
+        transport: ManifestTransport | None = None,
+    ) -> None:
+        """初始化资源管理器。
 
-        # 确保目录存在
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.game_dir.mkdir(parents=True, exist_ok=True)
+        Args:
+            config_manager: 配置管理器；缺省使用默认配置。传入的配置决定
+                ``data_dir`` / ``cache_dir`` / 并发数 / 超时等。
+            transport: 清单提供者；缺省走 aiohttp，测试可注入假实现。
 
-        # 资源服务器
+        Example:
+            >>> manager = ResourceManager(ConfigManager("/tmp/c.yaml"))
+            >>> isinstance(manager.get_cache_info()["cache_size"], int)
+            True
+        """
+        self.config_manager = config_manager or ConfigManager()
+        app_config = self.config_manager.get_app_config()
+
+        self.data_dir = Path(app_config.data_dir).expanduser()
+        self.cache_dir = Path(app_config.cache_dir).expanduser()
+        self.game_dir = self.data_dir / "game"
+        for directory in (self.data_dir, self.cache_dir, self.game_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+
         self.resource_servers = self._init_resource_servers()
-
-        # 并发控制
-        self.semaphore = asyncio.Semaphore(
-            self.config_manager.get_app_config().max_concurrent_downloads
+        self.validator = Validator()
+        self.downloader = Downloader(
+            concurrency=app_config.max_concurrent_downloads,
+            timeout=app_config.download_timeout,
         )
+        self.patcher = Patcher(
+            manifest_path=self.data_dir / "manifest.json",
+            game_dir=self.game_dir,
+            validator=self.validator,
+        )
+        self.transport = transport or AiohttpManifestTransport()
 
     def _init_resource_servers(self) -> list[ResourceServer]:
-        """初始化资源服务器"""
-        servers = [
+        """初始化内置资源服务器列表。
+
+        Returns:
+            主用与备用两个 :class:`ResourceServer`。
+        """
+        return [
             ResourceServer(
                 name="official",
                 endpoint="https://resources.identityv.com",
                 base_url="https://resources.identityv.com/v1",
                 current_version="1.0.0",
                 latest_version="1.0.0",
-                is_available=True
+                is_available=True,
             ),
             ResourceServer(
                 name="backup",
@@ -64,334 +136,305 @@ class ResourceManager:
                 base_url="https://backup.resources.identityv.com/v1",
                 current_version="1.0.0",
                 latest_version="1.0.0",
-                is_available=True
-            )
+                is_available=True,
+            ),
         ]
-        return servers
 
-    async def check_resources(self, server: str | None = None) -> ResourceCheckResult:
-        """检查游戏资源"""
-        logger.info("开始检查游戏资源...")
+    def _select_server(self, server: str | None) -> ResourceServer | None:
+        """按名称选择资源服务器。
 
-        try:
-            # 获取资源清单
-            manifest = await self._get_manifest(server)
-            if not manifest:
-                return ResourceCheckResult(
-                    total_files=0,
-                    healthy_files=0,
-                    corrupted_files=0,
-                    missing_files=0,
-                    scan_time=datetime.now()
-                )
+        Args:
+            server: 服务器名称；``None`` 表示使用第一个（主用）服务器。
 
-            # 扫描文件
-            total_files = len(manifest.files)
-            healthy_files = 0
-            corrupted_files = 0
-            missing_files = 0
-
-            for file_info in manifest.files:
-                file_path = self.game_dir / file_info.path
-
-                if not file_path.exists():
-                    missing_files += 1
-                    continue
-
-                # 检查文件大小
-                actual_size = file_path.stat().st_size
-                if actual_size != file_info.size:
-                    corrupted_files += 1
-                    continue
-
-                # 检查MD5
-                actual_md5 = await self._calculate_md5(file_path)
-                if actual_md5 != file_info.md5:
-                    corrupted_files += 1
-                    continue
-
-                healthy_files += 1
-
-            result = ResourceCheckResult(
-                total_files=total_files,
-                healthy_files=healthy_files,
-                corrupted_files=corrupted_files,
-                missing_files=missing_files,
-                scan_time=datetime.now()
-            )
-
-            logger.info(f"资源检查完成: {result}")
-            return result
-
-        except Exception as e:
-            logger.error(f"检查资源失败: {e}")
-            raise
-
-    async def update_resources(self, server: str | None = None, force: bool = False) -> ResourceUpdateResult:
-        """更新游戏资源"""
-        logger.info("开始更新游戏资源...")
-
-        try:
-            start_time = datetime.now()
-
-            # 获取资源清单
-            manifest = await self._get_manifest(server)
-            if not manifest:
-                return ResourceUpdateResult(
-                    success=False,
-                    error="无法获取资源清单",
-                    scan_time=datetime.now()
-                )
-
-            # 检查是否需要更新
-            if not force and await self._is_up_to_date(manifest):
-                logger.info("资源已是最新版本")
-                return ResourceUpdateResult(
-                    success=True,
-                    downloaded_files=0,
-                    updated_files=0,
-                    scan_time=datetime.now()
-                )
-
-            # 下载资源
-            downloaded_files = 0
-            updated_files = 0
-            failed_files = []
-            total_size = 0
-
-            # 创建下载任务
-            tasks = []
-            for file_info in manifest.files:
-                task = self._download_file(file_info)
-                tasks.append(task)
-
-            # 并发下载
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            # 处理结果
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    failed_files.append(manifest.files[i].name)
-                    logger.error(f"下载失败: {manifest.files[i].name} - {result}")
-                else:
-                    if result:
-                        downloaded_files += 1
-                        updated_files += 1
-                    total_size += manifest.files[i].size
-
-            elapsed_time = (datetime.now() - start_time).total_seconds()
-
-            result = ResourceUpdateResult(
-                success=len(failed_files) == 0,
-                downloaded_files=downloaded_files,
-                updated_files=updated_files,
-                failed_files=failed_files,
-                total_size=total_size,
-                elapsed_time=elapsed_time,
-                scan_time=datetime.now()
-            )
-
-            logger.info(f"资源更新完成: {result}")
-            return result
-
-        except Exception as e:
-            logger.error(f"更新资源失败: {e}")
-            return ResourceUpdateResult(
-                success=False,
-                error=str(e),
-                scan_time=datetime.now()
-            )
+        Returns:
+            匹配的 :class:`ResourceServer`；未找到返回 ``None``。
+        """
+        if server is None:
+            return self.resource_servers[0] if self.resource_servers else None
+        for candidate in self.resource_servers:
+            if candidate.name == server:
+                return candidate
+        logger.error("服务器不存在: %s", server)
+        return None
 
     async def _get_manifest(self, server: str | None = None) -> ResourceManifest | None:
-        """获取资源清单"""
+        """获取资源清单（含服务器选择与异常降级）。
+
+        Args:
+            server: 服务器名称。
+
+        Returns:
+            清单；无法获取时返回 ``None``。
+        """
+        selected = self._select_server(server)
+        if selected is None:
+            return None
         try:
-            # 选择服务器
-            if server:
-                srv = next((s for s in self.resource_servers if s.name == server), None)
-                if not srv:
-                    logger.error(f"服务器不存在: {server}")
-                    return None
-            else:
-                srv = self.resource_servers[0]
-
-            # 获取清单
-            url = f"{srv.base_url}/manifest.json"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return ResourceManifest(**data)
-                    else:
-                        logger.error(f"获取清单失败: {response.status}")
-                        return None
-
-        except Exception as e:
-            logger.error(f"获取资源清单失败: {e}")
+            return await self.transport.fetch_manifest(selected)
+        except Exception as exc:  # noqa: BLE001 - 传输层异常统一降级为 None
+            logger.error("获取资源清单异常: %s", exc)
             return None
 
-    async def _is_up_to_date(self, manifest: ResourceManifest) -> bool:
-        """检查资源是否已更新"""
-        try:
-            # 检查本地清单
-            local_manifest_path = self.data_dir / 'manifest.json'
-            if local_manifest_path.exists():
-                with open(local_manifest_path, encoding='utf-8') as f:
-                    local_data = json.load(f)
-                    local_manifest = ResourceManifest(**local_data)
-                    return local_manifest.version == manifest.version
+    def _verify_file(self, file_info: ResourceFile, path: Path) -> bool:
+        """校验单个已在磁盘上的文件。
 
+        仅当清单提供了 ``partial_hash`` 时才先做抽样快检；抽样未通过或无抽样
+        哈希字段时，回退到全量校验。
+
+        Args:
+            file_info: 清单中的文件信息。
+            path: 实际文件路径。
+
+        Returns:
+            文件完整有效返回 ``True``。
+        """
+        if not path.exists():
             return False
+        if file_info.partial_hash and self.validator.quick_check(
+            path, file_info.size, file_info.partial_hash
+        ):
+            return True
+        return self.validator.verify(
+            path, size=file_info.size, md5=file_info.md5, sha256=file_info.sha256
+        )
 
-        except Exception as e:
-            logger.error(f"检查更新状态失败: {e}")
-            return False
+    async def check_resources(self, server: str | None = None) -> ResourceCheckResult:
+        """检查游戏资源完整性。
 
-    async def _download_file(self, file_info: ResourceFile) -> bool:
-        """下载单个文件"""
-        async with self.semaphore:
-            try:
-                file_path = self.game_dir / file_info.path
+        Args:
+            server: 服务器名称；``None`` 使用主用服务器。
 
-                # 创建目录
-                file_path.parent.mkdir(parents=True, exist_ok=True)
+        Returns:
+            :class:`ResourceCheckResult`。清单拉取失败时返回全 0 结果并记录错误日志。
+        """
+        logger.info("开始检查游戏资源...")
+        manifest = await self._get_manifest(server)
+        if manifest is None:
+            logger.error("资源检查失败：无法获取资源清单")
+            return ResourceCheckResult(
+                total_files=0,
+                healthy_files=0,
+                corrupted_files=0,
+                missing_files=0,
+                outdated_files=0,
+                scan_time=datetime.now(),
+            )
 
-                # 检查文件是否已存在且正确
-                if file_path.exists():
-                    actual_size = file_path.stat().st_size
-                    if actual_size == file_info.size:
-                        # 快速验证MD5
-                        if await self._quick_md5_check(file_path, file_info.md5):
-                            return False  # 文件已存在且正确
+        healthy = corrupted = missing = 0
+        for file_info in manifest.files:
+            path = self.game_dir / file_info.path
+            if not path.exists():
+                missing += 1
+            elif self._verify_file(file_info, path):
+                healthy += 1
+            else:
+                corrupted += 1
 
-                # 下载文件
-                url = f"{self.resource_servers[0].base_url}/files/{file_info.name}"
+        result = ResourceCheckResult(
+            total_files=len(manifest.files),
+            healthy_files=healthy,
+            corrupted_files=corrupted,
+            missing_files=missing,
+            outdated_files=0,
+            scan_time=datetime.now(),
+        )
+        logger.info("资源检查完成: %s", result)
+        return result
 
-                # 使用临时文件
-                temp_path = file_path.with_suffix(file_path.suffix + '.tmp')
+    async def update_resources(
+        self, server: str | None = None, force: bool = False
+    ) -> ResourceUpdateResult:
+        """更新游戏资源。
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as response:
-                        if response.status == 200:
-                            # 下载到临时文件
-                            with open(temp_path, 'wb') as f:
-                                async for chunk in response.content.iter_chunked(8192):
-                                    f.write(chunk)
+        Args:
+            server: 服务器名称；``None`` 使用主用服务器。
+            force: 为 ``True`` 时忽略「版本未变」短路，改为按磁盘现状做修复式更新
+                （重新下载缺失/损坏文件）。
 
-                            # 验证下载的文件
-                            if await self._verify_downloaded_file(temp_path, file_info):
-                                # 重命名为正式文件
-                                temp_path.replace(file_path)
-                                return True
-                            else:
-                                # 删除无效的临时文件
-                                temp_path.unlink(missing_ok=True)
-                                return False
-                        else:
-                            logger.error(f"下载失败: {file_info.name} - {response.status}")
-                            return False
+        Returns:
+            :class:`ResourceUpdateResult`。清单拉取失败时 ``success=False`` 且
+            ``error`` 明确指明失败原因，调用方据此可与「无更新」区分。
+        """
+        logger.info("开始更新游戏资源...")
+        start_time = datetime.now()
 
-            except Exception as e:
-                logger.error(f"下载文件失败: {file_info.name} - {e}")
-                return False
+        manifest = await self._get_manifest(server)
+        if manifest is None:
+            message = "无法获取资源清单"
+            if server:
+                message = f"{message}（服务器: {server}）"
+            logger.error(message)
+            return ResourceUpdateResult(
+                success=False,
+                downloaded_files=0,
+                updated_files=0,
+                failed_files=[],
+                error=message,
+                total_size=0,
+                elapsed_time=0.0,
+                scan_time=datetime.now(),
+            )
 
-    async def _calculate_md5(self, file_path: Path) -> str:
-        """计算文件的MD5值"""
-        hash_md5 = hashlib.md5()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+        local_manifest = self.patcher.load_manifest()
+        if (
+            not force
+            and local_manifest is not None
+            and local_manifest.version == manifest.version
+        ):
+            logger.info("资源已是最新版本: %s", manifest.version)
+            return ResourceUpdateResult(
+                success=True,
+                downloaded_files=0,
+                updated_files=0,
+                failed_files=[],
+                error=None,
+                total_size=0,
+                elapsed_time=0.0,
+                scan_time=datetime.now(),
+            )
 
-    async def _quick_md5_check(self, file_path: Path, expected_md5: str) -> bool:
-        """快速MD5检查"""
+        if force:
+            plan = self._build_repair_plan(manifest, local_manifest)
+        else:
+            plan = self.patcher.plan(local_manifest, manifest)
+
+        patch_result = await self.patcher.apply(plan, self.downloader)
+
+        download_files = plan.files_to_download()
+        total_size = sum(
+            file_info.size
+            for file_info, result in zip(
+                download_files, patch_result.results, strict=True
+            )
+            if result.success
+        )
+        elapsed = (datetime.now() - start_time).total_seconds()
+        result = ResourceUpdateResult(
+            success=patch_result.success,
+            downloaded_files=patch_result.added + patch_result.updated,
+            updated_files=patch_result.updated,
+            failed_files=patch_result.failed_files,
+            error=patch_result.error,
+            total_size=total_size,
+            elapsed_time=elapsed,
+            scan_time=datetime.now(),
+        )
+        logger.info("资源更新完成: %s", result)
+        return result
+
+    def _build_repair_plan(
+        self, remote_manifest: ResourceManifest, local_manifest: ResourceManifest | None
+    ) -> PatchPlan:
+        """按磁盘现状构建修复计划（``force=True`` 时使用）。
+
+        与基于清单的增量不同，这里直接以文件系统为准：缺失或校验不通过的文件
+        进入 ``added`` / ``updated``（都会触发下载），其余为 ``unchanged``。
+
+        Args:
+            remote_manifest: 远端目标清单。
+            local_manifest: 本地清单，用于识别需要删除的多余文件。
+
+        Returns:
+            修复用的 :class:`PatchPlan`。
+        """
+        remote_paths = {file_info.path for file_info in remote_manifest.files}
+        added: list[ResourceFile] = []
+        updated: list[ResourceFile] = []
+        unchanged: list[ResourceFile] = []
+        for file_info in remote_manifest.files:
+            path = self.game_dir / file_info.path
+            if not path.exists():
+                added.append(file_info)
+            elif self._verify_file(file_info, path):
+                unchanged.append(file_info)
+            else:
+                updated.append(file_info)
+        removed = [
+            file_info
+            for file_info in (local_manifest.files if local_manifest else [])
+            if file_info.path not in remote_paths
+        ]
+        return PatchPlan(
+            download_url=remote_manifest.download_url,
+            remote_manifest=remote_manifest,
+            added=added,
+            updated=updated,
+            removed=removed,
+            unchanged=unchanged,
+        )
+
+    def clean_cache(self, all_files: bool = False) -> bool:
+        """清理缓存。
+
+        Args:
+            all_files: 为 ``True`` 时清空整个缓存目录；否则只删除 ``.tmp`` /
+                ``.part`` 临时文件。
+
+        Returns:
+            清理成功返回 ``True``，失败返回 ``False``。
+        """
         try:
-            # 只检查文件开头和结尾的MD5
-            hash_md5 = hashlib.md5()
-
-            # 读取开头1KB
-            with open(file_path, "rb") as f:
-                hash_md5.update(f.read(1024))
-
-            # 读取结尾1KB
-            file_size = file_path.stat().st_size
-            if file_size > 1024:
-                with open(file_path, "rb") as f:
-                    f.seek(file_size - 1024)
-                    hash_md5.update(f.read(1024))
-
-            return hash_md5.hexdigest() == expected_md5
-
-        except:
-            return False
-
-    async def _verify_downloaded_file(self, temp_path: Path, file_info: ResourceFile) -> bool:
-        """验证下载的文件"""
-        try:
-            # 检查文件大小
-            actual_size = temp_path.stat().st_size
-            if actual_size != file_info.size:
-                return False
-
-            # 检查MD5
-            actual_md5 = await self._calculate_md5(temp_path)
-            return actual_md5 == file_info.md5
-
-        except Exception as e:
-            logger.error(f"验证文件失败: {file_info.name} - {e}")
-            return False
-
-    def clean_cache(self, all: bool = False) -> bool:
-        """清理缓存"""
-        try:
-            if all:
-                # 删除整个缓存目录
-                import shutil
+            if all_files:
                 if self.cache_dir.exists():
                     shutil.rmtree(self.cache_dir)
-                    self.cache_dir.mkdir(parents=True, exist_ok=True)
-                logger.info("清理所有缓存")
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                logger.info("已清理全部缓存: %s", self.cache_dir)
             else:
-                # 删除临时文件
-                for temp_file in self.game_dir.glob('*.tmp'):
-                    temp_file.unlink(missing_ok=True)
-                logger.info("清理临时文件")
-
+                removed = 0
+                for directory in (self.cache_dir, self.game_dir):
+                    if not directory.exists():
+                        continue
+                    for pattern in ("*.tmp", "*.part"):
+                        for temp_file in directory.rglob(pattern):
+                            temp_file.unlink(missing_ok=True)
+                            removed += 1
+                logger.info("已清理临时文件: %d 个", removed)
             return True
-
-        except Exception as e:
-            logger.error(f"清理缓存失败: {e}")
+        except OSError as exc:
+            logger.error("清理缓存失败: %s", exc)
             return False
 
-    def get_cache_info(self) -> dict:
-        """获取缓存信息"""
+    def get_cache_info(self) -> dict[str, Any]:
+        """获取缓存与游戏资源目录统计。
+
+        Returns:
+            包含 ``cache_size`` / ``game_size``（原始字节）、``cache_size_human``
+            / ``game_size_human``（人类可读）、``cache_files`` / ``game_files``
+            / ``cache_dir`` / ``game_dir`` 的字典；读取异常时返回 ``{}``。
+        """
         try:
-            cache_size = 0
-            file_count = 0
-
-            if self.cache_dir.exists():
-                for file_path in self.cache_dir.rglob('*'):
-                    if file_path.is_file():
-                        cache_size += file_path.stat().st_size
-                        file_count += 1
-
-            game_size = 0
-            game_file_count = 0
-
-            if self.game_dir.exists():
-                for file_path in self.game_dir.rglob('*'):
-                    if file_path.is_file():
-                        game_size += file_path.stat().st_size
-                        game_file_count += 1
-
+            cache_size, cache_files = self._dir_stats(self.cache_dir)
+            game_size, game_files = self._dir_stats(self.game_dir)
             return {
-                'cache_size': cache_size,
-                'cache_files': file_count,
-                'game_size': game_size,
-                'game_files': game_file_count,
-                'cache_dir': str(self.cache_dir),
-                'game_dir': str(self.game_dir)
+                "cache_size": cache_size,
+                "cache_files": cache_files,
+                "game_size": game_size,
+                "game_files": game_files,
+                "cache_dir": str(self.cache_dir),
+                "game_dir": str(self.game_dir),
+                "cache_size_human": self.validator.human_size(cache_size),
+                "game_size_human": self.validator.human_size(game_size),
             }
-
-        except Exception as e:
-            logger.error(f"获取缓存信息失败: {e}")
+        except OSError as exc:
+            logger.error("获取缓存信息失败: %s", exc)
             return {}
+
+    @staticmethod
+    def _dir_stats(directory: Path) -> tuple[int, int]:
+        """递归统计目录内文件的总大小与数量。
+
+        Args:
+            directory: 目标目录。
+
+        Returns:
+            ``(总字节数, 文件数)``；目录不存在时返回 ``(0, 0)``。
+        """
+        if not directory.exists():
+            return 0, 0
+        total = 0
+        count = 0
+        for file_path in directory.rglob("*"):
+            if file_path.is_file():
+                total += file_path.stat().st_size
+                count += 1
+        return total, count

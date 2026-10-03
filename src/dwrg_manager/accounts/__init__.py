@@ -3,6 +3,6 @@
 """
 
 from .manager import AccountManager
-from .models import Account
+from .models import Account, LoginResult
 
-__all__ = ["AccountManager", "Account"]
+__all__ = ["AccountManager", "Account", "LoginResult"]

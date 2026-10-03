@@ -1,5 +1,14 @@
 """
 启动管理器
+
+负责游戏客户端的启动、停止与状态查询。启动路径按以下顺序解析：
+
+1. :class:`~dwrg_manager.launcher.models.LaunchConfig` 中显式指定的 ``game_path``；
+2. 环境变量 ``DWRG_GAME_PATH``；
+3. 平台常见安装位置（Windows 下为 Program Files / AppData / 家目录 Games）。
+
+若最终仍找不到可执行文件，:meth:`LauncherManager.launch_game` 会返回
+``False`` 并记录原因，不会抛出异常。
 """
 
 import os
@@ -7,346 +16,388 @@ import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import psutil
 
 from ..config.manager import ConfigManager
+from ..exceptions import LaunchError
 from ..utils.logger import get_logger
 from ..utils.system import SystemManager
-from .models import GameStatus, LaunchConfig
+from .models import GameStatus, LaunchConfig, LaunchResult
 
 logger = get_logger(__name__)
 
+#: 环境变量：显式指定游戏可执行文件路径
+ENV_GAME_PATH = "DWRG_GAME_PATH"
+
+#: 判定「磁盘空间充足」的下限（字节，10 GiB）
+MIN_FREE_BYTES = 10 * 1024**3
+
+#: 默认启动参数
+DEFAULT_LAUNCH_PARAMS: tuple[str, ...] = ("-fullscreen", "-high", "-thread", "4")
+
+#: 默认环境变量
+DEFAULT_ENV_VARS: dict[str, str] = {"DXGI_DEBUG": "1", "ENABLE_DX12": "1"}
+
+
+def default_game_candidates() -> list[Path]:
+    """返回候选的游戏可执行文件路径列表。
+
+    Returns:
+        按优先级排列的候选路径。
+    """
+    home = Path.home()
+    candidates = [
+        home / "Games" / "IdentityV" / "IdentityV.exe",
+        home / ".dwrg" / "game" / "IdentityV.exe",
+    ]
+    if platform.system() == "Windows":
+        candidates.extend(
+            [
+                Path("C:/Program Files (x86)/IdentityV/IdentityV.exe"),
+                Path("C:/Program Files/IdentityV/IdentityV.exe"),
+                home / "AppData" / "Local" / "IdentityV" / "IdentityV.exe",
+            ]
+        )
+    return candidates
+
 
 class LauncherManager:
-    """启动管理器"""
+    """启动管理器。
 
-    def __init__(self):
-        self.config_manager = ConfigManager()
-        self.system_manager = SystemManager()
+    Args:
+        config_manager: 注入的配置管理器；为 ``None`` 时使用默认配置。
+        system_manager: 注入的系统管理器；为 ``None`` 时使用默认实现。
+    """
+
+    def __init__(
+        self,
+        config_manager: ConfigManager | None = None,
+        system_manager: SystemManager | None = None,
+    ) -> None:
+        self.config_manager = config_manager or ConfigManager()
+        self.system_manager = system_manager or SystemManager()
+        self.logger = get_logger(__name__)
         self.game_process: psutil.Process | None = None
         self.launch_config: LaunchConfig | None = None
         self.start_time: datetime | None = None
 
-    def launch_game(self, account_id: str | None = None,
-                   server_name: str | None = None,
-                   verbose: bool = False) -> bool:
-        """启动游戏"""
-        logger.info("准备启动游戏...")
+    # ------------------------------------------------------------------ #
+    # 启动
+    # ------------------------------------------------------------------ #
+    def launch_game(
+        self,
+        account_id: str | None = None,
+        server_name: str | None = None,
+        verbose: bool = False,
+    ) -> bool:
+        """启动游戏客户端。
+
+        Args:
+            account_id: 使用的账号 ID；为 ``None`` 时沿用配置中的当前账号。
+            server_name: 使用的渠道服；为 ``None`` 时沿用配置中的当前渠道服。
+            verbose: 是否把游戏子进程的输出透传出来。
+
+        Returns:
+            是否成功拉起进程。
+        """
+        result = self.launch(
+            account_id=account_id, server_name=server_name, verbose=verbose
+        )
+        return result.success
+
+    def launch(
+        self,
+        account_id: str | None = None,
+        server_name: str | None = None,
+        verbose: bool = False,
+    ) -> LaunchResult:
+        """启动游戏客户端并返回结构化结果。
+
+        Args:
+            account_id: 使用的账号 ID。
+            server_name: 使用的渠道服。
+            verbose: 是否透传子进程输出。
+
+        Returns:
+            :class:`LaunchResult`；失败时 ``error_message`` 说明原因。
+        """
+        self.logger.info("准备启动游戏...")
 
         try:
-            # 验证配置
-            if not self._validate_launch_config(account_id, server_name):
-                return False
+            self._prepare_launch_config(account_id, server_name)
+            assert self.launch_config is not None  # noqa: S101 - 上面必然赋值
 
-            # 获取游戏路径
-            game_path = self._get_game_path()
-            if not game_path.exists():
-                logger.error(f"游戏不存在: {game_path}")
-                return False
+            game_path = self._get_game_path(self.launch_config)
+            if game_path is None or not game_path.exists():
+                message = (
+                    f"未找到游戏可执行文件（已尝试 {ENV_GAME_PATH} 与默认安装路径）"
+                )
+                self.logger.error(message)
+                return LaunchResult(
+                    success=False, error_message=message, config=self.launch_config
+                )
 
-            # 构建启动命令
             cmd = self._build_launch_command(game_path, account_id, server_name)
-
-            # 设置工作目录
-            working_dir = game_path.parent
-
-            # 设置环境变量
+            working_dir = self.launch_config.working_dir or str(game_path.parent)
             env = self._build_environment()
 
-            # 启动游戏
-            if platform.system() == 'Windows':
-                # Windows平台
-                creation_flags = subprocess.CREATE_NEW_CONSOLE
-                if self.launch_config.is_admin:
-                    creation_flags |= subprocess.CREATE_NO_WINDOW
+            stdout = subprocess.PIPE if verbose else subprocess.DEVNULL
+            stderr = subprocess.PIPE if verbose else subprocess.DEVNULL
+            kwargs: dict[str, Any] = {
+                "cwd": working_dir,
+                "env": env,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+            if platform.system() == "Windows":  # pragma: no cover - 依平台而定
+                creation_flags = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+                kwargs["creationflags"] = creation_flags
 
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=working_dir,
-                    env=env,
-                    creationflags=creation_flags,
-                    stdout=subprocess.PIPE if verbose else subprocess.DEVNULL,
-                    stderr=subprocess.PIPE if verbose else subprocess.DEVNULL
-                )
-            else:
-                # Unix-like平台
-                process = subprocess.Popen(
-                    cmd,
-                    cwd=working_dir,
-                    env=env,
-                    stdout=subprocess.PIPE if verbose else subprocess.DEVNULL,
-                    stderr=subprocess.PIPE if verbose else subprocess.DEVNULL
-                )
-
-            # 保存进程信息
+            process = subprocess.Popen(cmd, **kwargs)
             self.game_process = psutil.Process(process.pid)
             self.start_time = datetime.now()
+            self.logger.info("游戏启动成功，进程ID: %s", process.pid)
+            return LaunchResult(
+                success=True, process_id=process.pid, config=self.launch_config
+            )
 
-            logger.info(f"游戏启动成功，进程ID: {process.pid}")
+        except (OSError, LaunchError, subprocess.SubprocessError) as exc:
+            self.logger.error("启动游戏失败: %s", exc)
+            return LaunchResult(
+                success=False, error_message=str(exc), config=self.launch_config
+            )
+
+    def _prepare_launch_config(
+        self, account_id: str | None, server_name: str | None
+    ) -> LaunchConfig:
+        """校验并组装启动配置。
+
+        Args:
+            account_id: 账号 ID。
+            server_name: 渠道服名称。
+
+        Returns:
+            组装好的 :class:`LaunchConfig`。
+
+        Raises:
+            LaunchError: 指定的账号或渠道服不存在。
+        """
+        app_config = self.config_manager.get_app_config()
+        final_account = account_id or app_config.account
+        final_server = server_name or app_config.server
+
+        if (
+            final_account
+            and self.config_manager.get_account_config(final_account) is None
+        ):
+            raise LaunchError(f"账号不存在: {final_account}", account_id=final_account)
+        if final_server and self.config_manager.get_server_config(final_server) is None:
+            raise LaunchError(f"渠道服不存在: {final_server}", server=final_server)
+
+        self.launch_config = LaunchConfig(
+            account_id=final_account,
+            server_name=final_server,
+            launch_params=list(DEFAULT_LAUNCH_PARAMS),
+            env_vars=dict(DEFAULT_ENV_VARS),
+        )
+        return self.launch_config
+
+    # ------------------------------------------------------------------ #
+    # 停止 / 状态
+    # ------------------------------------------------------------------ #
+    def stop_game(self, force: bool = False) -> bool:
+        """停止游戏进程。
+
+        Args:
+            force: 为 ``True`` 时直接强杀，否则先尝试优雅终止。
+
+        Returns:
+            是否成功停止（进程本就不存在视为成功）。
+        """
+        self.logger.info("准备停止游戏...")
+        if self.game_process is None or not self.game_process.is_running():
+            self.logger.warning("游戏未运行")
+            self.game_process = None
             return True
 
-        except Exception as e:
-            logger.error(f"启动游戏失败: {e}")
-            return False
-
-    def stop_game(self, force: bool = False) -> bool:
-        """停止游戏"""
-        logger.info("准备停止游戏...")
-
         try:
-            if not self.game_process:
-                logger.warning("游戏未运行")
-                return True
-
             if force:
-                # 强制终止
                 self.game_process.kill()
-                logger.info("强制终止游戏进程")
+                self.logger.info("已强制终止游戏进程")
             else:
-                # 优雅终止
                 self.game_process.terminate()
-
-                # 等待进程结束
                 try:
                     self.game_process.wait(timeout=10)
-                    logger.info("游戏进程已优雅终止")
+                    self.logger.info("游戏进程已优雅终止")
                 except psutil.TimeoutExpired:
-                    # 超时后强制终止
                     self.game_process.kill()
-                    logger.info("游戏进程已强制终止")
-
-            # 清理状态
-            self.game_process = None
-            self.start_time = None
-            self.launch_config = None
-
-            return True
-
-        except Exception as e:
-            logger.error(f"停止游戏失败: {e}")
+                    self.logger.info("优雅终止超时，已强制终止")
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            self.logger.error("停止游戏失败: %s", exc)
             return False
+
+        self.game_process = None
+        self.start_time = None
+        self.launch_config = None
+        return True
 
     def get_game_status(self) -> GameStatus:
-        """获取游戏状态"""
+        """查询游戏运行状态。
+
+        Returns:
+            :class:`GameStatus`；进程已退出时 ``is_running`` 为 ``False``。
+        """
+        if self.game_process is None or not self.game_process.is_running():
+            self.game_process = None
+            self.start_time = None
+            return GameStatus(is_running=False, launch_config=self.launch_config)
+
         try:
-            if not self.game_process:
-                return GameStatus(
-                    is_running=False,
-                    launch_config=self.launch_config
-                )
-
-            # 检查进程是否仍在运行
-            if not self.game_process.is_running():
-                self.game_process = None
-                self.start_time = None
-                return GameStatus(
-                    is_running=False,
-                    launch_config=self.launch_config
-                )
-
-            # 获取进程信息
-            cpu_usage = self.game_process.cpu_percent()
             memory_info = self.game_process.memory_info()
+            cpu_usage = self.game_process.cpu_percent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            self.logger.warning("读取进程信息失败: %s", exc)
+            return GameStatus(is_running=False, launch_config=self.launch_config)
 
-            # 计算运行时间
-            if self.start_time:
-                running_time = (datetime.now() - self.start_time).total_seconds()
-            else:
-                running_time = 0
+        running_time = (
+            (datetime.now() - self.start_time).total_seconds()
+            if self.start_time
+            else 0.0
+        )
+        return GameStatus(
+            is_running=True,
+            process_id=self.game_process.pid,
+            cpu_usage=cpu_usage,
+            memory_usage=memory_info.rss,
+            running_time=running_time,
+            launch_config=self.launch_config,
+        )
 
-            return GameStatus(
-                is_running=True,
-                process_id=self.game_process.pid,
-                cpu_usage=cpu_usage,
-                memory_usage=memory_info.rss,
-                running_time=running_time,
-                launch_config=self.launch_config
-            )
+    # ------------------------------------------------------------------ #
+    # 辅助
+    # ------------------------------------------------------------------ #
+    def _get_game_path(self, config: LaunchConfig | None = None) -> Path | None:
+        """解析游戏可执行文件路径。
 
-        except Exception as e:
-            logger.error(f"获取游戏状态失败: {e}")
-            return GameStatus(
-                is_running=False,
-                launch_config=self.launch_config
-            )
+        Args:
+            config: 启动配置（可能含显式 ``game_path``）。
 
-    def _validate_launch_config(self, account_id: str | None,
-                              server_name: str | None) -> bool:
-        """验证启动配置"""
-        try:
-            # 获取当前配置
-            app_config = self.config_manager.get_app_config()
+        Returns:
+            找到的路径；全部候选都不存在时返回 ``None``。
+        """
+        explicit = (config.game_path if config else "") or os.environ.get(
+            ENV_GAME_PATH, ""
+        )
+        if explicit:
+            path = Path(explicit).expanduser()
+            return path
 
-            # 使用提供的参数或默认值
-            final_account_id = account_id or app_config.account
-            final_server_name = server_name or app_config.server
+        for candidate in default_game_candidates():
+            if candidate.exists():
+                return candidate
+        return None
 
-            # 验证账号
-            if final_account_id:
-                account = self.config_manager.get_account_config(final_account_id)
-                if not account:
-                    logger.error(f"账号不存在: {final_account_id}")
-                    return False
+    def _build_launch_command(
+        self, game_path: Path, account_id: str | None, server_name: str | None
+    ) -> list[str]:
+        """构造启动命令行。
 
-            # 验证服务器
-            if final_server_name:
-                server = self.config_manager.get_server_config(final_server_name)
-                if not server:
-                    logger.error(f"服务器不存在: {final_server_name}")
-                    return False
+        Args:
+            game_path: 游戏可执行文件路径。
+            account_id: 账号 ID。
+            server_name: 渠道服名称。
 
-            # 创建启动配置
-            self.launch_config = LaunchConfig(
-                account_id=final_account_id,
-                server_name=final_server_name,
-                launch_params=self._get_default_launch_params(),
-                working_dir="",
-                env_vars=self._get_default_env_vars(),
-                is_admin=False,
-                auto_restart=False,
-                priority="normal"
-            )
-
-            return True
-
-        except Exception as e:
-            logger.error(f"验证启动配置失败: {e}")
-            return False
-
-    def _get_game_path(self) -> Path:
-        """获取游戏路径"""
-        # 这里可以根据实际情况调整游戏路径
-        app_config = self.config_manager.get_app_config()
-        game_path = Path.home() / 'Games' / 'IdentityV' / 'IdentityV.exe'
-
-        if not game_path.exists():
-            # 尝试其他可能的路径
-            possible_paths = [
-                Path('C:/Program Files (x86)/IdentityV/IdentityV.exe'),
-                Path('C:/Program Files/IdentityV/IdentityV.exe'),
-                Path.home() / 'AppData' / 'Local' / 'IdentityV' / 'IdentityV.exe'
-            ]
-
-            for path in possible_paths:
-                if path.exists():
-                    game_path = path
-                    break
-
-        return game_path
-
-    def _build_launch_command(self, game_path: Path,
-                             account_id: str | None,
-                             server_name: str | None) -> list[str]:
-        """构建启动命令"""
+        Returns:
+            命令与参数列表。
+        """
         cmd = [str(game_path)]
-
-        # 添加启动参数
         if self.launch_config:
             cmd.extend(self.launch_config.launch_params)
-
-        # 添加账号参数
         if account_id:
-            cmd.extend(['-account', account_id])
-
-        # 添加服务器参数
+            cmd.extend(["-account", account_id])
         if server_name:
-            cmd.extend(['-server', server_name])
-
+            cmd.extend(["-server", server_name])
         return cmd
 
     def _build_environment(self) -> dict[str, str]:
-        """构建环境变量"""
-        env = os.environ.copy()
+        """构造子进程环境变量。
 
+        Returns:
+            环境变量字典。
+        """
+        env = os.environ.copy()
         if self.launch_config:
             env.update(self.launch_config.env_vars)
-
-        # 添加游戏特定的环境变量
-        env['DWRG_LAUNCHED'] = '1'
+        env["DWRG_LAUNCHED"] = "1"
         if self.launch_config and self.launch_config.account_id:
-            env['DWRG_ACCOUNT'] = self.launch_config.account_id
+            env["DWRG_ACCOUNT"] = self.launch_config.account_id
         if self.launch_config and self.launch_config.server_name:
-            env['DWRG_SERVER'] = self.launch_config.server_name
-
+            env["DWRG_SERVER"] = self.launch_config.server_name
         return env
 
-    def _get_default_launch_params(self) -> list[str]:
-        """获取默认启动参数"""
-        return [
-            '-fullscreen',
-            '-high',
-            '-thread',
-            '4'
-        ]
+    def diagnose_launch(self) -> dict[str, object]:
+        """诊断启动环境。
 
-    def _get_default_env_vars(self) -> dict[str, str]:
-        """获取默认环境变量"""
-        return {
-            'DXGI_DEBUG': '1',
-            'ENABLE_DX12': '1'
+        Returns:
+            含 ``game_exists`` / ``game_path`` / ``account_valid`` /
+            ``server_valid`` / ``disk_space`` / ``recommendations`` 的字典。
+        """
+        diagnosis: dict[str, object] = {
+            "game_exists": False,
+            "game_path": None,
+            "account_valid": False,
+            "server_valid": False,
+            "disk_space": False,
+            "recommendations": [],
         }
+        recommendations: list[str] = diagnosis["recommendations"]  # type: ignore[assignment]
 
-    def diagnose_launch(self) -> dict:
-        """诊断启动问题"""
-        diagnosis = {
-            'game_exists': False,
-            'game_path': None,
-            'account_valid': False,
-            'server_valid': False,
-            'disk_space': False,
-            'permissions': True,
-            'recommendations': []
-        }
+        game_path = self._get_game_path(self.launch_config)
+        diagnosis["game_exists"] = game_path is not None
+        diagnosis["game_path"] = str(game_path) if game_path else None
+        if game_path is None:
+            recommendations.append(
+                f"未找到游戏客户端，请通过 {ENV_GAME_PATH} 环境变量或配置指定路径"
+            )
 
-        try:
-            # 检查游戏路径
-            game_path = self._get_game_path()
-            diagnosis['game_exists'] = game_path.exists()
-            diagnosis['game_path'] = str(game_path)
+        app_config = self.config_manager.get_app_config()
+        account_id = (
+            self.launch_config.account_id if self.launch_config else None
+        ) or app_config.account
+        if account_id:
+            diagnosis["account_valid"] = (
+                self.config_manager.get_account_config(account_id) is not None
+            )
+            if not diagnosis["account_valid"]:
+                recommendations.append(f"账号配置无效: {account_id}")
 
-            if not diagnosis['game_exists']:
-                diagnosis['recommendations'].append("请确保游戏已正确安装")
+        server_name = (
+            self.launch_config.server_name if self.launch_config else None
+        ) or app_config.server
+        if server_name:
+            diagnosis["server_valid"] = (
+                self.config_manager.get_server_config(server_name) is not None
+            )
+            if not diagnosis["server_valid"]:
+                recommendations.append(f"渠道服配置无效: {server_name}")
 
-            # 检查账号
-            if self.launch_config and self.launch_config.account_id:
-                account = self.config_manager.get_account_config(self.launch_config.account_id)
-                diagnosis['account_valid'] = account is not None
-                if not diagnosis['account_valid']:
-                    diagnosis['recommendations'].append("请检查账号配置")
+        free_bytes = 0
+        for disk in self.system_manager.get_disk_info():
+            if disk.get("free_bytes"):
+                free_bytes = max(free_bytes, int(disk["free_bytes"]))
+        diagnosis["disk_space"] = free_bytes >= MIN_FREE_BYTES
+        if not diagnosis["disk_space"]:
+            recommendations.append("可用磁盘空间不足 10 GiB，建议清理磁盘")
 
-            # 检查服务器
-            if self.launch_config and self.launch_config.server_name:
-                server = self.config_manager.get_server_config(self.launch_config.server_name)
-                diagnosis['server_valid'] = server is not None
-                if not diagnosis['server_valid']:
-                    diagnosis['recommendations'].append("请检查服务器配置")
+        return diagnosis
 
-            # 检查磁盘空间
-            disk_info = self.system_manager.get_disk_info()
-            if disk_info:
-                # 检查C盘空间
-                c_drive = next((d for d in disk_info if 'C:' in d['device']), None)
-                if c_drive:
-                    free_space = int(c_drive['free'].split()[0])  # 假设格式是 "XX GB"
-                    diagnosis['disk_space'] = free_space > 10  # 至少10GB空间
-                    if not diagnosis['disk_space']:
-                        diagnosis['recommendations'].append("磁盘空间不足，请清理磁盘")
 
-            # 检查权限
-            if platform.system() == 'Windows':
-                import ctypes
-                try:
-                    # 检查是否是管理员
-                    is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-                    diagnosis['permissions'] = is_admin
-                    if not diagnosis['permissions']:
-                        diagnosis['recommendations'].append("建议以管理员权限运行")
-                except:
-                    diagnosis['permissions'] = True
-
-            return diagnosis
-
-        except Exception as e:
-            logger.error(f"诊断启动问题失败: {e}")
-            return diagnosis
+__all__ = [
+    "DEFAULT_ENV_VARS",
+    "DEFAULT_LAUNCH_PARAMS",
+    "ENV_GAME_PATH",
+    "LauncherManager",
+    "default_game_candidates",
+]

@@ -1,43 +1,42 @@
 """
 渠道服数据模型
+
+.. note::
+   :class:`ServerConfig` 的唯一定义位于
+   :mod:`dwrg_manager.config.models`，此处仅做再导出，避免同一概念出现
+   两份字段不一致的定义（历史遗留问题）。
 """
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from ..config.models import ServerConfig
 
-class ServerConfig(BaseModel):
-    """渠道服配置模型"""
-    name: str = Field(..., description="渠道服名称")
-    endpoint: str = Field(..., description="服务器端点")
-    region: str = Field("CN", description="地区")
-    status: str = Field("active", description="状态")
-    version: str = Field("1.0.0", description="版本")
-    is_default: bool = Field(False, description="是否为默认服务器")
-    last_check: datetime | None = Field(None, description="最后检查时间")
-    ping: float | None = Field(None, description="延迟")
-    players: int | None = Field(None, description="在线玩家数")
-
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v else None
-        }
+__all__ = ["ServerConfig", "ServerManagerConfig", "ServerStatus"]
 
 
 class ServerStatus(BaseModel):
-    """渠道服状态模型"""
-    name: str
-    status: str
-    version: str
-    players: int
-    ping: float
-    last_check: datetime
+    """一次渠道服状态探测的结果。"""
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    name: str = Field(..., description="渠道服名称")
+    status: str = Field(..., description="渠道服状态")
+    version: str = Field("1.0.0", description="渠道服版本")
+    players: int = Field(0, ge=0, description="在线玩家数")
+    ping: float = Field(..., description="网络延迟(毫秒)")
+    last_check: datetime = Field(default_factory=datetime.now, description="探测时间")
 
 
 class ServerManagerConfig(BaseModel):
-    """渠道服管理器配置"""
+    """渠道服管理器的运行参数。"""
+
+    model_config = ConfigDict(validate_assignment=True)
+
     auto_detect: bool = Field(True, description="自动检测渠道服")
-    check_interval: int = Field(300, description="检测间隔(秒)")
-    timeout: int = Field(10, description="检测超时(秒)")
-    preferred_servers: list = Field([], description="优先服务器列表")
+    check_interval: int = Field(300, ge=10, description="检测间隔(秒)")
+    timeout: int = Field(10, ge=1, description="检测超时(秒)")
+    preferred_servers: list[str] = Field(
+        default_factory=list, description="优先服务器列表"
+    )
