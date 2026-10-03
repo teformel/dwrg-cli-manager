@@ -1,0 +1,11 @@
+typer
+pydantic
+pyyaml
+cryptography
+rich
+aiohttp
+aiofiles
+tqdm
+python-dotenv
+pytest
+pytest-asyncio

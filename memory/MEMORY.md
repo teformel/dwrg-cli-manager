@@ -1,0 +1,10 @@
+- [项目计划](project-plan.md) — 第五人格命令行管理器项目规划，包括功能需求、技术栈、项目结构、开发阶段规划和关键实现点
+- [Vibe Coding规范](vibe-coding.md) — 项目代码规范，包括类型安全、代码风格、错误处理、文档规范等详细规范和工具配置
+- [测试标准](testing-standards.md) — 项目测试标准和规范，包括单元测试、集成测试、性能测试和端到端测试
+- [CI/CD标准](ci-cd-standards.md) — 持续集成和持续部署流程和标准，包括GitHub Actions工作流、自动化测试和部署策略
+- [文档标准](documentation-standards.md) — 文档编写标准和规范，包括用户文档、开发者文档、API文档和示例代码
+- [安全标准](security-standards.md) — 安全标准和规范，包括数据安全、网络安全、进程安全和文件系统安全
+- [性能标准](performance-standards.md) — 性能标准和优化规范，包括异步编程、缓存管理、内存管理和性能监控
+- [国际化标准](internationalization-standards.md) — 国际化标准和规范，包括多语言支持、日期时间格式化、数字和货币格式化
+- [插件系统标准](plugin-system-standards.md) — 插件系统标准和规范，包括插件接口、插件管理、插件开发和插件发布
+- [Linux命令规范](linux-cli-standards.md) — 严格遵循Linux命令规范和用户习惯的CLI设计，包括命令命名、参数设计、输出格式和交互设计
