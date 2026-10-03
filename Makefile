@@ -11,6 +11,9 @@
 PYTHON   ?= python
 SRC_DIR  ?= src
 TEST_DIR ?= tests
+# ruff 同时覆盖 src / tests / examples；mypy 只跑 src（examples 是演示代码，
+# 不必受 disallow_untyped_defs 的完整约束）
+LINT_DIRS ?= src tests examples
 DIST_DIR ?= dist
 COV_DIR  ?= htmlcov
 
@@ -37,16 +40,16 @@ install-dev:
 
 ## fmt: 自动格式化源码并应用安全的 lint 修复
 fmt:
-	$(PYTHON) -m ruff format $(SRC_DIR)
-	$(PYTHON) -m ruff check --fix $(SRC_DIR)
+	$(PYTHON) -m ruff format $(LINT_DIRS)
+	$(PYTHON) -m ruff check --fix $(LINT_DIRS)
 
 ## fmt-check: 仅检查格式，不修改任何文件
 fmt-check:
-	$(PYTHON) -m ruff format --check $(SRC_DIR)
+	$(PYTHON) -m ruff format --check $(LINT_DIRS)
 
 ## lint: 运行 ruff 静态检查
 lint:
-	$(PYTHON) -m ruff check $(SRC_DIR)
+	$(PYTHON) -m ruff check $(LINT_DIRS)
 
 ## type: 运行 mypy 类型检查
 type:

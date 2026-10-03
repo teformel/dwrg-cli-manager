@@ -1,7 +1,7 @@
 # .github/workflows/ci.yml
 # 持续集成：多 Python 版本 × 多平台矩阵。
-# 质量命令与本地保持一致：
-#   ruff format --check src / ruff check src / mypy src / pytest
+# 质量命令与本地保持一致（LINT_DIRS = src examples，TEST_DIR = tests）：
+#   ruff format --check src examples / ruff check src examples / mypy src / pytest
 name: CI
 
 on:
@@ -56,15 +56,15 @@ jobs:
       #   2) 其中 mypy 在 Windows 上尤其慢，跳过可显著缩短矩阵总时长。
       # 如需在 Windows 上也做 lint/类型检查，删掉下面三个步骤的 if 条件即可。
 
-      - name: 格式检查 (ruff format --check src)
+      - name: 格式检查 (ruff format --check src examples tests)
         if: runner.os != 'Windows'
-        run: ruff format --check src
+        run: ruff format --check src examples tests
 
-      - name: 静态检查 (ruff check src)
-        # 注意：pyproject 的 [tool.ruff] 里设置了 fix = true。
-        # 若希望 CI 绝不自动改写文件，可改为：ruff check --no-fix src
+      - name: 静态检查 (ruff check src examples tests)
+        # pyproject 的 [tool.ruff] 刻意没有设置 fix = true，
+        # 因此 CI 里的 ruff check 只报告、不改写文件，失败即失败。
         if: runner.os != 'Windows'
-        run: ruff check src
+        run: ruff check src examples tests
 
       - name: 类型检查 (mypy src)
         if: runner.os != 'Windows'

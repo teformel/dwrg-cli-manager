@@ -126,6 +126,12 @@ dmypy.json
 *.swo
 *~
 
+# ruff
+.ruff_cache/
+
+# 本地环境变体（例如从 Windows 迁到 WSL 后留下的 .venv.win.bak）
+.venv.*/
+
 # OS
 .DS_Store
 .DS_Store?

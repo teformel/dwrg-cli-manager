@@ -1,11 +1,8 @@
-typer
-pydantic
-pyyaml
-cryptography
-rich
-aiohttp
-aiofiles
-tqdm
-python-dotenv
-pytest
-pytest-asyncio
+# 依赖的唯一来源是 pyproject.toml。
+#
+# 本文件只是 `pip install -r requirements.txt` 的便捷入口，
+# 具体依赖与版本约束请改 pyproject.toml，不要在这里重复维护
+# （历史上两者曾失步，出现过 httpx / loguru / tqdm 这类已不再使用的僵尸依赖）。
+#
+# 默认安装「运行依赖 + 开发工具」。只要运行依赖请改用： pip install .
+-e .[dev]
