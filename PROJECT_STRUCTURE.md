@@ -120,7 +120,8 @@ dwrg-cli-manager/
 - **`security/`**：加密与输入校验的**唯一实现处**。
   `crypto.py` 负责 Fernet 密钥（`~/.dwrg/keyfile`，0600）与 PBKDF2-HMAC-SHA256 密码哈希；
   `validation.py` 收敛全部输入校验规则。
-  `utils/crypto.py` 与 `utils/security.py` 只是向后兼容的再导出，不要在新代码里用。
+  `src/dwrg_manager/utils/crypto.py` 与 `utils/security.py` 只是向后兼容的再导出，
+  不要在新代码里用。
 - **`i18n/`**：`translator.py` 提供 `t()` 与语言切换，locale 是普通 JSON，
   新增语言只需加一个文件并在 `SUPPORTED_LANGUAGES` 中登记。
 - **`utils/`**：无领域知识的通用能力。日志用标准库 `logging`（不引入 loguru），
@@ -131,7 +132,8 @@ dwrg-cli-manager/
 
 ## 数据模型的两条重要约定
 
-1. **`ServerConfig` 只有一个定义**，位于 `config/models.py`；`servers/models.py`
+1. **`ServerConfig` 只有一个定义**，位于
+   `src/dwrg_manager/config/models.py`；`src/dwrg_manager/servers/models.py`
    仅做再导出。历史上这两个文件各有一份字段不一致的定义，是当时最严重的坑。
 2. **`AccountConfig`（持久化）与 `Account`（运行时）是两种东西**。
    前者含 `encrypted_password` / `password_hash`，后者是去掉密钥材料后的业务视图。
@@ -153,5 +155,6 @@ dwrg-cli-manager/
 1. **模块化**：每个子包只依赖它下层的模块，禁止 `utils` 反向依赖领域模块。
 2. **可扩展**：渠道服、语言、插件都是数据驱动的，新增不需要改核心代码。
 3. **用户友好**：命令与选项有中文帮助文本；错误信息带 `可用: a, b, c` 这类可执行提示。
-4. **安全可靠**：敏感信息加密落盘；所有外部输入先过 `security/validation.py`；
+4. **安全可靠**：敏感信息加密落盘；所有外部输入先过
+   `src/dwrg_manager/security/validation.py`；
    配置文件采用「临时文件 + `os.replace`」原子写入。
