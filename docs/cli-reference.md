@@ -390,6 +390,65 @@ dwrg account logout
 
 当前无登录账号时输出 `! 当前没有登录的账号`。
 
+### 8. `dwrg account export`
+
+加密导出全部账号为单个文件。
+
+**语法**
+
+```text
+dwrg account export [OPTIONS] PATH
+```
+
+| 参数 / 选项 | 类型 | 默认 | 说明 |
+|-------------|------|------|------|
+| `PATH` | `TEXT` | — | 导出目标文件路径（必需） |
+| `--config` | `TEXT` | `None` | 自定义配置文件路径 |
+
+导出文件为 JSON 外壳 + Fernet 加密载荷（含密文密码与哈希），采用原子写入。
+没有可导出账号时命令失败。
+
+**示例**
+
+```bash
+dwrg account export ~/backup/idv-accounts.json
+```
+
+```text
+✓ 已导出 2 个账号到 C:\Users\me\backup\idv-accounts.json
+```
+
+### 9. `dwrg account import`
+
+从加密导出文件导入并合并账号。
+
+**语法**
+
+```text
+dwrg account import [OPTIONS] PATH
+```
+
+| 参数 / 选项 | 短写 | 类型 | 默认 | 说明 |
+|-------------|------|------|------|------|
+| `PATH` | — | `TEXT` | — | 导入的导出文件路径（必需） |
+| `--force` | `-f` | 布尔 | `False` | 覆盖已存在的同 ID 账号；省略时跳过 |
+| `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
+
+导入采用两段式：先全量校验整个文件（结枌与加密载荷），再逐条应用；
+任何一条校验失败都不会写入任何账号。
+
+**示例**
+
+```bash
+dwrg account import ~/backup/idv-accounts.json --force
+```
+
+```text
+  跳过已存在的账号: tester
+  新增账号: player2
+✓ 导入完成：新增 1，覆盖 0，跳过 1
+```
+
 ## 四、渠道服管理 `dwrg server`
 
 ### 1. `dwrg server list`
