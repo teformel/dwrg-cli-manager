@@ -41,6 +41,7 @@
 
 - 新增 `dwrg self-update`（`--check` 仅检查）：后台查询 PyPI，离线静默失败。
 - `launch` 新墟 `--dry-run`：只打印将执行的命令行、环境变量与工作目录。
+- `launch` / `launch start` 新墟 `--graphics/-g <sd|hd|uhd>`，以 `-graphics=<档位>` 透传（对标 ww 3.7 的 `-krqlv` 档位机制）。
 - `launch` 新墟 `--graphics <hd|sd|uhd>` 画质档位参数。
 - `diagnose` 新墟检查项：游戏目录可写性、磁盘空间、密钥文件权限（0600）、
   渠道服配置完整性、资源源可达性（HEAD 探测，失败仅告警）。

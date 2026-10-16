@@ -939,6 +939,9 @@ def launch_entry(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="只打印将执行的命令与环境变量，不真正启动"
     ),
+    graphics: str | None = typer.Option(
+        None, "--graphics", "-g", help="画质档位: sd / hd / uhd"
+    ),
     config: str | None = typer.Option(None, "--config", help="自定义配置文件路径"),
 ) -> None:
     """启动游戏；不带子命令时直接执行 ``dwrg launch``。
@@ -949,11 +952,12 @@ def launch_entry(
         server: 渠道服。
         verbose: 是否透传子进程输出。
         dry_run: 是否只演练而不真正启动。
+        graphics: 画质档位；为 ``None`` 时使用默认 ``hd``。
         config: 自定义配置文件路径。
     """
     if ctx.invoked_subcommand is not None:
         return
-    _do_launch(account, server, verbose, dry_run, config)
+    _do_launch(account, server, verbose, dry_run, config, graphics)
 
 
 @launch_app.command("start")
@@ -964,10 +968,13 @@ def launch_start(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="只打印将执行的命令与环境变量，不真正启动"
     ),
+    graphics: str | None = typer.Option(
+        None, "--graphics", "-g", help="画质档位: sd / hd / uhd"
+    ),
     config: str | None = typer.Option(None, "--config", help="自定义配置文件路径"),
 ) -> None:
     """启动游戏（等价于 ``dwrg launch``）。"""
-    _do_launch(account, server, verbose, dry_run, config)
+    _do_launch(account, server, verbose, dry_run, config, graphics)
 
 
 def _do_launch(
@@ -976,6 +983,7 @@ def _do_launch(
     verbose: bool,
     dry_run: bool = False,
     config: str | None = None,
+    graphics: str | None = None,
 ) -> None:
     """执行启动逻辑。
 
@@ -985,10 +993,13 @@ def _do_launch(
         verbose: 是否透传子进程输出。
         dry_run: 为 ``True`` 时只展示启动计划，不拉起进程。
         config: 自定义配置文件路径。
+        graphics: 画质档位；为 ``None`` 时使用默认 ``hd``。
     """
     with _cli_errors("启动游戏"):
         launcher = LauncherManager(ConfigManager(config) if config else ConfigManager())
-        result = launcher.launch(account, server, verbose, dry_run=dry_run)
+        result = launcher.launch(
+            account, server, verbose, dry_run=dry_run, graphics=graphics
+        )
         if dry_run:
             _show_launch_plan(launcher.last_plan)
             return

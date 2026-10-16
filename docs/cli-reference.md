@@ -952,6 +952,8 @@ dwrg launch start [OPTIONS]
 | `--account` | `-a` | `TEXT` | `None` | 账号 ID；省略时沿用当前账号 |
 | `--server` | `-s` | `TEXT` | `None` | 渠道服；省略时沿用当前渠道服 |
 | `--verbose` | `-v` | 布尔 | `False` | 透传游戏子进程输出 |
+| `--dry-run` | — | 布尔 | `False` | 只打印启动计划（命令行 / 环境变量 / 工作目录），不真正启动 |
+| `--graphics` | `-g` | `TEXT` | `None` | 画质档位 `sd` / `hd` / `uhd`；省略时用 `hd`，以 `-graphics=<档位>` 透传 |
 | `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
 
 **示例**
@@ -964,10 +966,25 @@ dwrg launch --server official
 ✓ 游戏已启动，进程ID: 12345
 ```
 
-未找到可执行文件时：
+未找到可执行文件时；启动前检查的每一项失败都会附带可执行的修复建议：
 
 ```text
-✗ 未找到游戏可执行文件（已尝试 DWRG_GAME_PATH 与默认安装路径）
+✗ 启动前检查未通过: 未找到游戏可执行文件（已尝试 DWRG_GAME_PATH 与默认安装路径）
+  （建议: 请设置环境变量 DWRG_GAME_PATH 指向客户端可执行文件，或运行 dwrg diagnose 查看已探测到的安装位置）
+```
+
+用 `--dry-run` 只查看将会执行什么：
+
+```bash
+dwrg launch --dry-run --graphics uhd
+```
+
+```text
+工作目录: C:\Users\me\Games\IdentityV
+可执行文件: C:\Users\me\Games\IdentityV\IdentityV.exe
+渠道服: official
+命令行: C:\Users\me\Games\IdentityV\IdentityV.exe -fullscreen -high -thread 4 -graphics=uhd
+环境变量: DWRG_LAUNCHED=1, DWRG_SERVER=official
 ```
 
 ### 2. `dwrg launch stop`
