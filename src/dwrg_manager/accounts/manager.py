@@ -9,10 +9,16 @@
 
 这一设计同时解决了旧实现的两个问题：重启后无法解密（密钥每次随机）、
 以及校验密码时引用了不存在的 ``password_hash`` 字段。
+
+此外本管理器还负责：
+
+* 登录态（``~/.dwrg/session.json``，权限 ``0600``）的写入与清除；
+* 账号材料的加密导出与合并导入。
 """
 
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from ..config.manager import ConfigManager
 from ..config.models import AccountConfig
@@ -21,6 +27,14 @@ from ..security.crypto import decrypt_data, encrypt_data, hash_password, verify_
 from ..security.validation import validate_password, validate_username
 from ..utils.logger import get_logger
 from .models import Account, LoginResult
+from .session import Session, clear_session, get_active_session, write_session
+from .transfer import (
+    ExportedAccount,
+    ImportReport,
+    accounts_from_config,
+    export_accounts,
+    import_accounts,
+)
 
 logger = get_logger(__name__)
 
@@ -42,9 +56,24 @@ class AccountManager:
         'tester'
     """
 
-    def __init__(self, config_manager: ConfigManager | None = None) -> None:
+    def __init__(
+        self,
+        config_manager: ConfigManager | None = None,
+        *,
+        session_file: str | Path | None = None,
+    ) -> None:
+        """初始化账号管理器。
+
+        Args:
+            config_manager: 注入的配置管理器；为 ``None`` 时使用默认配置。
+            session_file: 自定义登录态文件路径；为 ``None`` 时使用
+                :func:`~dwrg_manager.accounts.session.default_session_path`。
+        """
         self.config_manager = config_manager or ConfigManager()
         self.logger = get_logger(__name__)
+        self._session_file: Path | None = (
+            Path(session_file).expanduser() if session_file else None
+        )
 
     # ------------------------------------------------------------------ #
     # 转换
@@ -299,6 +328,10 @@ class AccountManager:
     def login(self, account_id: str, server: str | None = None) -> LoginResult:
         """执行账号登录。
 
+        除更新配置中的当前账号与最后登录时间外，还会把登录态写入
+        ``~/.dwrg/session.json``（权限 ``0600``，原子写入），供启动器读取并
+        注入子进程环境变量。
+
         Args:
             account_id: 账号 ID。
             server: 目标渠道服；为 ``None`` 时沿用账号自身配置。
@@ -325,6 +358,14 @@ class AccountManager:
         now = datetime.now()
         self.update_account(account_id, last_login=now, server=target_server)
         self.config_manager.switch_account(account_id)
+        self.save_session(
+            Session(
+                account_id=cfg.id,
+                server=target_server,
+                username=cfg.username,
+                logged_in_at=now,
+            )
+        )
         self.logger.info("账号登录: %s -> %s", cfg.username, target_server)
         return LoginResult(
             success=True,
@@ -334,6 +375,63 @@ class AccountManager:
             message="登录信息已就绪",
             timestamp=now,
         )
+
+    def save_session(self, session: Session) -> Path | None:
+        """把登录态写入磁盘（失败不阻断登录流程）。
+
+        Args:
+            session: 待保存的登录态。
+
+        Returns:
+            写入的文件路径；写入失败时返回 ``None`` 并记录警告。
+        """
+        try:
+            return write_session(session, self._session_file)
+        except OSError as exc:
+            self.logger.warning("登录态写入失败: %s", exc)
+            return None
+
+    def get_session(self) -> Session | None:
+        """读取当前登录态。
+
+        Returns:
+            :class:`~dwrg_manager.accounts.session.Session` 实例；
+            未登录或登录态损坏时返回 ``None``。
+        """
+        return get_active_session(self._session_file)
+
+    def logout(self, clear_config: bool = True) -> bool:
+        """登出当前账号。
+
+        清除登录态文件；``clear_config`` 为 ``True`` 时同时重置配置中的
+        当前账号与 ``is_current`` 标记。
+
+        Args:
+            clear_config: 是否同时清理主配置里的当前账号。
+
+        Returns:
+            此前是否存在登录态或当前账号。
+
+        Raises:
+            AccountError: 登录态文件删除失败。
+        """
+        had_session = False
+        try:
+            had_session = clear_session(self._session_file)
+        except AccountError as exc:
+            self.logger.warning("登录态清除失败: %s", exc)
+
+        config = self.config_manager.get_config()
+        had_account = bool(config.app.account) or any(
+            acc.is_current for acc in config.accounts.values()
+        )
+        if clear_config and (config.app.account or had_account):
+            config.app.account = None
+            for acc in config.accounts.values():
+                acc.is_current = False
+            self.config_manager.save_config()
+        self.logger.info("账号已登出")
+        return had_session or had_account
 
     def simulate_login(self, account: Account) -> LoginResult:
         """对内存中的账号对象执行一次登录演练。
@@ -345,6 +443,69 @@ class AccountManager:
             登录结果。
         """
         return self.login(account.id)
+
+    # ------------------------------------------------------------------ #
+    # 导出 / 导入
+    # ------------------------------------------------------------------ #
+    def export_accounts(self, path: str | Path) -> Path:
+        """把全部账号加密导出为单文件。
+
+        Args:
+            path: 目标文件路径。
+
+        Returns:
+            实际写入的文件路径。
+
+        Raises:
+            AccountError: 没有账号或写入失败。
+        """
+        accounts = accounts_from_config(self.config_manager)
+        written = export_accounts(accounts, path)
+        self.logger.info("导出 %d 个账号到 %s", len(accounts), written)
+        return written
+
+    def import_accounts(self, path: str | Path, *, force: bool = False) -> ImportReport:
+        """从导出文件导入账号并合并到当前配置。
+
+        Args:
+            path: 导出文件路径。
+            force: 是否允许覆盖已存在的账号 ID。
+
+        Returns:
+            :class:`~dwrg_manager.accounts.transfer.ImportReport` 统计结果。
+
+        Raises:
+            AccountError: 文件不存在、内容损坏或渠道服缺失。
+        """
+        config = self.config_manager.get_config()
+        return import_accounts(
+            path,
+            known_account_ids=set(config.accounts),
+            known_servers=set(config.servers),
+            force=force,
+            apply=self._apply_imported_account,
+        )
+
+    def _apply_imported_account(self, account: ExportedAccount) -> None:
+        """把一条导入的账号材料写回配置。
+
+        Args:
+            account: 解密并校验后的账号材料。
+        """
+        existing = self.config_manager.get_account_config(account.id)
+        is_current = existing.is_current if existing else False
+        self.config_manager.save_account(
+            AccountConfig(
+                id=account.id,
+                username=account.username,
+                server=account.server,
+                encrypted_password=account.encrypted_password,
+                password_hash=account.password_hash,
+                created_at=account.created_at or datetime.now(),
+                last_login=account.last_login,
+                is_current=is_current,
+            )
+        )
 
 
 __all__ = ["AccountManager"]

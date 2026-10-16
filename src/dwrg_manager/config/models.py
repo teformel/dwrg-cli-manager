@@ -44,6 +44,97 @@ DEFAULT_SERVER_DEFINITIONS: tuple[tuple[str, str, str], ...] = (
 #: 默认渠道服名称集合
 DEFAULT_SERVER_NAMES: tuple[str, ...] = tuple(d[0] for d in DEFAULT_SERVER_DEFINITIONS)
 
+#: 资源源名称允许的字符集（与渠道服一致，便于人工维护配置文件）
+RESOURCE_SOURCE_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[A-Za-z0-9_-]+$")
+
+#: 开箱即用的资源源定义：(名称, 直链 URL, 渠道, 说明)
+#:
+#: 来自 2026-10-03 的实测记录（见 ``memory/resource-source-research.md``）：
+#: 国际服（NeoX2 与旧包）直链可用且支持 ``Range``；NeoX2 包的 ETag 即整文件
+#: MD5，旧包 ETag 带 ``-N`` 后缀（分片上传），此时不能当 MD5 使用。
+#: 国服 PC 端公开直链已 403，因此不预置，需由用户自行配置覆盖。
+DEFAULT_RESOURCE_SOURCE_DEFINITIONS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "oversea_neox2",
+        "https://h55na.gdl.easebar.com/identityv_setup_neox2_oversea_release_240912.exe",
+        "oversea",
+        "国际服 NeoX2 完整包（ETag 即整文件 MD5，支持 Range 断点续传）",
+    ),
+    (
+        "oversea_legacy",
+        "https://h55na.gdl.easebar.com/identityv_setup_release_oversea.exe",
+        "oversea",
+        "国际服旧完整包（ETag 带 -N 后缀，不能当 MD5，只能校验大小）",
+    ),
+)
+
+
+class ResourceSourceConfig(BaseModel):
+    """单个资源源（安装包 / 资源直链）的配置。
+
+    资源源是「下载地址 + 元数据来源」的组合，与渠道服配置是两套独立概念：
+    渠道服描述账号登录的目标，资源源描述客户端文件的获取来源。
+    国服 PC 端公开直链已关闭，因此资源源必须可由用户配置覆盖（走本地
+    已安装目录时改用 LocalIndexTransport）。
+
+    Attributes:
+        name: 资源源唯一名称，例如 oversea_neox2。
+        url: 安装包 / 资源文件的完整直链（http 或 https）。
+        channel: 所属渠道标识，例如 oversea / cn。
+        description: 人类可读说明，便于在资源信息中展示。
+        is_available: 是否启用；为 False 时该源被跳过。
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    name: str = Field(..., description="资源源名称")
+    url: str = Field(..., description="资源源直链")
+    channel: str = Field("", description="渠道标识")
+    description: str = Field("", description="资源源说明")
+    is_available: bool = Field(True, description="是否启用")
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """校验资源源名称（非空且仅含字母/数字/下划线/短横线）。
+
+        Args:
+            v: 待校验的名称。
+
+        Returns:
+            去除首尾空白后的名称。
+
+        Raises:
+            ValueError: 名称为空或包含非法字符。
+        """
+        name = v.strip()
+        if not name:
+            raise ValueError("资源源名称不能为空")
+        if not RESOURCE_SOURCE_NAME_PATTERN.match(name):
+            raise ValueError("资源源名称只能包含字母、数字、下划线和短横线")
+        return name
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """校验资源源直链必须是合法的 http(s) 绝对地址。
+
+        Args:
+            v: 待校验的 URL。
+
+        Returns:
+            去除首尾空白后的 URL。
+
+        Raises:
+            ValueError: URL 为空或协议不是 http/https。
+        """
+        url = v.strip()
+        if not url:
+            raise ValueError("资源源直链不能为空")
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValueError("资源源直链必须是 http(s) 地址")
+        return url
+
 
 class ServerConfig(BaseModel):
     """渠道服配置。
@@ -164,6 +255,24 @@ class AccountConfig(BaseModel):
         return f"{self.id[:width]}..." if len(self.id) > width else self.id
 
 
+def default_resource_sources() -> list[ResourceSourceConfig]:
+    """构造默认的资源源列表。
+
+    Returns:
+        预置国际服两条已实测直链的 :class:`ResourceSourceConfig` 列表。
+    """
+    return [
+        ResourceSourceConfig(
+            name=name,
+            url=url,
+            channel=channel,
+            description=description,
+            is_available=True,
+        )
+        for name, url, channel, description in DEFAULT_RESOURCE_SOURCE_DEFINITIONS
+    ]
+
+
 class AppConfig(BaseModel):
     """应用程序级配置。"""
 
@@ -176,9 +285,19 @@ class AppConfig(BaseModel):
     language: str = Field("zh-CN", description="语言")
     data_dir: str = Field("~/.dwrg", description="数据目录")
     cache_dir: str = Field("~/.dwrg/cache", description="缓存目录")
+    game_path: str = Field(
+        "", description="游戏目录（为空时取 data_dir/game；checkout 一次设置永久生效）"
+    )
     log_level: str = Field("INFO", description="日志级别")
     max_concurrent_downloads: int = Field(5, ge=1, le=10, description="最大并发下载数")
     download_timeout: int = Field(300, ge=5, le=3600, description="下载超时时间(秒)")
+    resource_sources: list[ResourceSourceConfig] = Field(
+        default_factory=default_resource_sources,
+        description="资源源列表（安装包/资源直链），可由用户覆盖",
+    )
+    resource_source: str = Field(
+        "", description="当前使用的资源源名称；为空时取列表中第一个可用源"
+    )
 
     @field_validator("language")
     @classmethod
@@ -313,6 +432,29 @@ class Config(BaseModel):
         """
         return self.model_dump(mode="json")
 
+    def get_resource_source(
+        self, name: str | None = None
+    ) -> ResourceSourceConfig | None:
+        """按名称获取资源源配置。
+
+        Args:
+            name: 资源源名称；为 ``None`` 或空串时使用 ``app.resource_source``
+                指定的当前源，仍未指定则取第一个可用源。
+
+        Returns:
+            资源源配置；不存在时返回 ``None``。
+        """
+        target = (name or self.app.resource_source).strip()
+        if target:
+            for source in self.app.resource_sources:
+                if source.name == target:
+                    return source
+            return None
+        for source in self.app.resource_sources:
+            if source.is_available:
+                return source
+        return None
+
 
 def default_servers() -> dict[str, ServerConfig]:
     """构造默认的渠道服集合。
@@ -354,10 +496,13 @@ __all__ = [
     "SERVER_NAME_PATTERN",
     "DEFAULT_SERVER_DEFINITIONS",
     "DEFAULT_SERVER_NAMES",
+    "RESOURCE_SOURCE_NAME_PATTERN",
+    "ResourceSourceConfig",
     "ServerConfig",
     "AccountConfig",
     "AppConfig",
     "Config",
     "default_servers",
+    "default_resource_sources",
     "default_config",
 ]

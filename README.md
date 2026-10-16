@@ -84,16 +84,25 @@ dwrg status
 
 | 能力 | 说明 |
 |------|------|
-| 多渠道服 | 内置 `official` / `bserver` / `test_server`，支持新增、删除、切换、设默认与并发延迟探测 |
-| 多账号 | 创建、列出、切换、删除、登录 / 登出；密码以密文 + 哈希双形式存储 |
-| 资源管理 | 完整性检查、增量更新、缓存统计与清理；并发下载与断点续传 |
-| 启动管理 | 路径解析、启动参数与环境组装、停止进程、运行状态查询 |
+| 秒级渠道服切换 | `dwrg checkout` 利用 MD5 差异缓存称为切换：首次快照当前渠道服，
+  之后任意切换从本地缓存恢复，不重下载整包；大版本变化自动重置缓存 |
+| 全量校验与修复 | `dwrg sync` 对比差异缓存快照的 MD5，报告损坏 / 缺失，
+  `--repair` 从缓存修复；`dwrg download` 从零下载客户端框架 |
+| 本地资源索引 | `dwrg resource index <DIR>` 扫描目录生成清单（path / size / md5），
+  原子写入；`HttpIndexTransport` 可用 HTTP ETag 当 MD5 作为补充源 |
+| 多渠道服 | 内置 `official` / `bserver` / `test_server`，支持新墟、删除、设默认与并发延迟探测 |
+| 多账号 | 创建、列出、切换、删除、登录 / 登出、加密导出 / 导入；
+  密码以密文 + 哈希双形式存储 |
+| 启动管理 | 路径解析、启动前检查（磁盘空间 / 进程冲突 / 可执行文件）、
+  `--dry-run` 演练、画质档位参数、进程停止与状态查询 |
+| 抽卡记录 | `dwrg gacha` 扫描游戏日志提取记录链接，`-o/--open` 一键打开浏览器 |
+| 自更新 | `dwrg self-update` 后台查询 PyPI 版本，离线静默不报错 |
 | 配置管理 | YAML / JSON 双格式；查看、设置、重置、导出、导入；原子写入 |
 | 插件系统 | 目录 / 单文件布局动态加载 `Plugin` 子类，启用状态持久化 |
 | 国际化 | 9 种语言代码，点号键目录与回退链，日期时间本地化 |
-| 安全 | Fernet 密钥文件（`0600`）、PBKDF2-HMAC-SHA256 哈希、集中式输入校验 |
+| 安全 | Fernet 密钥文件（`0600`）、PBKDF2-HMAC-SHA256 哈希、集中式输入校验；
+  所有缓存恢复经过 `validate_path` 防目录穿越 |
 | 可观测性 | Rich 表格 / 面板、`--format json`、滚动日志、`diagnose` 诊断报告 |
-
 ## 命令总览
 
 | 命令 | 子命令 |
@@ -101,12 +110,17 @@ dwrg status
 | `dwrg help` | — |
 | `dwrg diagnose` | — |
 | `dwrg status` | — |
-| `dwrg account` | `add` `list` `switch` `remove` `status` `login` `logout` |
+| `dwrg self-update` | `--check` 仅检查版本 |
+| `dwrg account` | `add` `list` `switch` `remove` `status` `login` `logout` `export` `import` |
 | `dwrg server` | `list` `current` `detect` `switch` `show` `info` `add` `remove` `set-default` |
-| `dwrg resource` | `check` `verify` `update` `clean` `info` |
+| `dwrg checkout` | `<server>` `--path/-p` `--force-sync` |
+| `dwrg sync` | `--path/-p` `--repair` |
+| `dwrg download` | `<server>` `--path/-p` |
+| `dwrg resource` | `index` `check` `verify` `update` `clean` `info` |
 | `dwrg launch` | `start` `stop` `status`（不带子命令时等同 `start`） |
 | `dwrg config` | `show` `set` `unset` `reset` `export` `import` |
 | `dwrg plugin` | `list` `info` `enable` `disable` |
+| `dwrg gacha` | `scan`（不带子命令时等同 `scan`） |
 
 全局选项：`--version/-V`、`--verbose/-v`、`--lang`。子命令普遍支持 `--config`（`plugin` 子命令用 `--plugin-dir`）。完整说明见 [CLI 命令参考](docs/cli-reference.md)。
 

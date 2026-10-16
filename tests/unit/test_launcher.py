@@ -253,7 +253,8 @@ class TestLaunch:
         result = launcher.launch()
 
         assert result.success is False
-        assert "未找到游戏可执行文件" in (result.error_message or "")
+        assert "游戏可执行文件不存在" in (result.error_message or "")
+        assert "DWRG_GAME_PATH" in (result.error_message or "")
 
     def test_launch_returns_failure_on_launch_error(
         self, launcher: LauncherManager, config_manager: ConfigManager
@@ -360,9 +361,7 @@ class TestDiagnoseLaunch:
         """缺少客户端且磁盘不足时应给出建议。"""
         monkeypatch.setattr(launcher, "_get_game_path", lambda *_a, **_k: None)
         monkeypatch.setattr(
-            launcher.system_manager,
-            "get_disk_info",
-            lambda: [{"free_bytes": 1024}],
+            launcher.system_manager, "free_space_bytes", lambda *_a: 1024
         )
 
         report = launcher.diagnose_launch()
@@ -380,8 +379,8 @@ class TestDiagnoseLaunch:
         monkeypatch.setattr(launcher, "_get_game_path", lambda *_a, **_k: exe)
         monkeypatch.setattr(
             launcher.system_manager,
-            "get_disk_info",
-            lambda: [{"free_bytes": 20 * 1024**3}],
+            "free_space_bytes",
+            lambda *_a: 20 * 1024**3,
         )
 
         report = launcher.diagnose_launch()

@@ -202,9 +202,13 @@ def validate_path(
 ) -> Path:
     """校验并规范化文件路径，防止目录穿越。
 
+    当 ``base`` 存在且 ``value`` 为相对路径时，以 ``base`` 为根目录拼接，
+    而不是按进程当前工作目录解析。
+
     Args:
         value: 待校验的路径。
-        base: 允许的根目录；提供时会确保解析后的路径仍位于该目录之下。
+        base: 允许的根目录；提供时相对路径以它为根解析，并确保解析后的
+            路径仍位于该目录之下。
         must_exist: 是否要求路径必须已存在。
 
     Returns:
@@ -216,6 +220,10 @@ def validate_path(
     if not isinstance(value, (str, Path)):
         raise ValidationError("路径必须是字符串或 Path", field="path")
     path = Path(value).expanduser()
+    if base is not None and not path.is_absolute():
+        # 相对路径以 base 为根解析，而不是进程 CWD：否则清单里的
+        # "IdentityV.exe" 会被解析成 <cwd>/IdentityV.exe 而永远判为越界。
+        path = Path(base).expanduser() / path
     try:
         resolved = path.resolve()
     except OSError as exc:  # pragma: no cover - 依赖文件系统

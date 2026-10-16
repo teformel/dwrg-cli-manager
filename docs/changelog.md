@@ -6,9 +6,60 @@
 
 ## [Unreleased]
 
-### 计划中
+### 新增
 
-- 待补充。
+#### 秒级渠道服切换
+
+- 新增顶层命令 `dwrg checkout <server>`、`dwrg sync`、`dwrg download <server>`，
+  对标 `wutheringwaves-cli-manager` 的 `ww checkout` / `ww sync` / `ww download` 三件套。
+- 差异缓存机制：首次切换把当前渠道服文件快照进
+  `<game_dir>/dwrg_server_diff_cache/<server>/`，之后任意切换优先从本地缓存恢复。
+- 大版本变化（`version` 文件内容改变）自动重置缓存。
+- 切换前备份渠道配置文件（`dwrg_server_config_backup/`），失败即中止，
+  不留中间态。
+- `ChannelSwitcher` 新墟 `detect_current_server` / `rollback` / `cache_info` / `reset_cache` 能力。
+
+#### 资源管理
+
+- 新增 `dwrg resource index <DIR>`：扫描本地目录生成清单（path / size / md5），
+  默认写入 `<DIR>/manifest.json`（原子写入）。
+- 新增 `HttpIndexTransport` / `LocalIndexTransport`。
+- 删除编造的 `resources.identityv.com` 资源源，资源源改为从
+  `AppConfig.resource_sources` 读取（默认为已实测的国际服直链）。
+- `resource check` / `verify` / `update` 新墟 `--dir` 与 `--source local|http|auto` 选项。
+
+#### 账号管理
+
+- 新增 `dwrg account export` / `dwrg account import`：Fernet 加密导出上下文，
+  import 重失误时全量校验后再逐条应用。
+- 新增登录态（`~/.dwrg/session.json`，0600）；`launch` 在启动配置未显式
+  指定账号 / 渠道服时自动注入。
+- 新增 `dwrg gacha` / `dwrg gacha scan`：扫描游戏日志提取抽卡记录链接，
+  支持 `-o/--open` 打开浏览器；日志加密时给出提示而非报错。
+
+#### 启动与可观测性
+
+- 新增 `dwrg self-update`（`--check` 仅检查）：后台查询 PyPI，离线静默失败。
+- `launch` 新墟 `--dry-run`：只打印将执行的命令行、环境变量与工作目录。
+- `launch` 新墟 `--graphics <hd|sd|uhd>` 画质档位参数。
+- `diagnose` 新墟检查项：游戏目录可写性、磁盘空间、密钥文件权限（0600）、
+  渠道服配置完整性、资源源可达性（HEAD 探测，失败仅告警）。
+- `status` 补充游戏进程探测（PID / 进程名 / 运行时长）。
+
+### 修复
+
+- `validate_path` 在提供 `base` 时将相对路径以 `base` 为根解析，而不是按进程
+  CWD 解析；修复了 `dwrg sync` 把清单里的 `IdentityV.exe` 误判为路径越界、
+  导致全部文件被跳过的问题。
+- `dwrg diagnose` 的懒加载相对导入修正为单点导入（`cli.py` 位于包根，
+  `..` 超出顶层包会抛 `ImportError`）。
+- `ChannelSwitcher` 的 `_downloader` 属性与方法重名冲突（导致 mypy 报
+  `method-assign`）重命名为 `_downloader_ref`。
+
+### 变更
+
+- ruff 新墟 `extend-exclude = [".archive"]`；该目录是重构前的遗留脚本式测试，
+  不参与 pytest 收集，因此也不再计入 lint。
 
 ## [1.0.0] - 2026-10-03
 

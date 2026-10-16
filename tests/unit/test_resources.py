@@ -455,15 +455,15 @@ async def test_manager_check_counts(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_manager_check_uses_selected_server(tmp_path: Path) -> None:
-    """server 参数透传到传输层；未知服务器不触发请求。"""
+    """server 参数透传到传输层；未知资源源不触发请求。"""
     manifest = make_manifest("1", [])
     transport = FakeTransport(manifest)
     manager = ResourceManager(make_config(tmp_path), transport=transport)
 
-    await manager.check_resources("backup")
+    await manager.check_resources("oversea_legacy")
     await manager.check_resources("does-not-exist")
 
-    assert transport.calls == ["backup"]
+    assert transport.calls == ["oversea_legacy"]
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,9 @@ line-length = 88
 target-version = "py310"
 # 注意：这里刻意不设 `fix = true`，否则 CI 里的 `ruff check` 会静默改写文件却仍退出 0。
 # 本地想自动修复请用 `make fmt`（ruff format + ruff check --fix）。
+# .archive/legacy-tests/ 是重构前的遗留脚本式测试，不参与 pytest 收集（见
+# PROJECT_STRUCTURE.md），因此同样排除在 lint 之外，避免为死代码返工。
+extend-exclude = [".archive"]
 
 [tool.ruff.lint]
 select = [

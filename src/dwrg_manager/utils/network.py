@@ -7,6 +7,8 @@
 :class:`~dwrg_manager.exceptions.ServerError`。
 """
 
+import urllib.error
+import urllib.request
 from time import perf_counter
 from typing import Any
 
@@ -19,6 +21,9 @@ DEFAULT_TIMEOUT = 10
 
 #: 默认 User-Agent
 USER_AGENT = "dwrg-cli-manager/1.0.0"
+
+#: 资源源可达性探测（HEAD）的默认超时（秒）
+PROBE_TIMEOUT = 5
 
 
 def _timeout(seconds: int | float) -> aiohttp.ClientTimeout:
@@ -142,12 +147,67 @@ async def detect_server_region(endpoint: str, timeout: int = DEFAULT_TIMEOUT) ->
     return "unknown"
 
 
+def probe_url(url: str, timeout: int = PROBE_TIMEOUT) -> dict[str, Any]:
+    """用 HEAD 请求探测一个资源地址的可达性。
+
+    这是一个**同步**函数：资源源探测通常由诊断类命令在主线程里逐个调用，
+    不值得为此引入事件循环；同时它也只依赖标准库 ``urllib``，避免额外拉起
+    aiohttp 会话。
+
+    任何失败（DNS、连接、超时、非 2xx/3xx 状态码）都会以
+    ``reachable=False`` 的结果返回，而不抛出异常，保证诊断命令在离线环境下
+    依然可以正常结束。
+
+    Args:
+        url: 待探测的完整地址。
+        timeout: 超时秒数。
+
+    Returns:
+        含 ``reachable`` / ``status_code`` / ``elapsed_ms`` / ``error`` 的字典。
+
+    Example:
+        >>> probe_url("https://example.com")["reachable"]  # doctest: +SKIP
+        True
+    """
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": USER_AGENT}
+    )
+    start = perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 0) or response.getcode() or 0)
+            elapsed = (perf_counter() - start) * 1000
+            reachable = 200 <= status < 400
+            return {
+                "reachable": reachable,
+                "status_code": status,
+                "elapsed_ms": round(elapsed, 1),
+                "error": None if reachable else f"意外的状态码 {status}",
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "reachable": False,
+            "status_code": int(exc.code),
+            "elapsed_ms": round((perf_counter() - start) * 1000, 1),
+            "error": f"HTTP {exc.code}",
+        }
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {
+            "reachable": False,
+            "status_code": None,
+            "elapsed_ms": round((perf_counter() - start) * 1000, 1),
+            "error": str(getattr(exc, "reason", exc)),
+        }
+
+
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "PROBE_TIMEOUT",
     "USER_AGENT",
     "check_server_status",
     "detect_game_version",
     "detect_server_region",
     "fetch_json",
     "ping_server",
+    "probe_url",
 ]

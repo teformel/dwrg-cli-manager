@@ -4,13 +4,23 @@
 封装跨平台的系统信息采集、进程管理与文件操作。所有方法都做了降级处理：
 在权限不足或平台特性缺失时返回空结果并记录日志，而不是抛出异常，
 以保证 CLI 的「诊断」类命令永远可执行。
+
+除基础采集外，本模块还提供两类「探测」能力，供启动前检查与系统诊断复用：
+
+* :meth:`SystemManager.find_game_processes`：按进程名 + 命令行匹配游戏进程，
+  用于判断「游戏是否已在运行」，避免重复启动；
+* :meth:`SystemManager.detect_install_locations`：按平台惯例枚举可能的安装
+  位置（Windows 读注册表卸载信息，Linux/macOS 读常见目录），全部失败时
+  返回空列表而不抛异常。
 """
 
 import importlib
 import logging
 import os
 import platform
+import shutil
 import socket
+import stat
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +32,21 @@ from .logger import get_logger
 
 #: 常见的第五人格客户端进程名（Windows）
 GAME_PROCESS_NAMES: tuple[str, ...] = ("IdentityV.exe", "identityv.exe", "game.exe")
+
+#: 常见的第五人格客户端可执行文件名（跨平台，含无后缀的 Linux/macOS 形态）
+GAME_EXECUTABLE_NAMES: tuple[str, ...] = (
+    "IdentityV.exe",
+    "identityv.exe",
+    "IdentityV",
+    "identityv",
+    "game.exe",
+)
+
+#: Windows 注册表中需要扫描的「卸载信息」根键
+_WINDOWS_UNINSTALL_KEYS: tuple[str, ...] = (
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+)
 
 
 def _read_os_release() -> str:
@@ -248,6 +273,342 @@ class SystemManager:
                 return processes[0]
         return None
 
+    def find_game_processes(
+        self, game_dir: str | Path | None = None
+    ) -> list[dict[str, Any]]:
+        """按进程名与命令行查找游戏进程。
+
+        匹配策略是「进程名命中」或「命令行中出现游戏目录」二者其一：
+
+        * 进程名（不区分大小写）命中 :data:`GAME_PROCESS_NAMES` 中的任意一项；
+        * 命令行参数中包含 ``game_dir``（或其任一子路径），用于在用户把客户端
+          改名为其他可执行文件时仍然能识别。
+
+        Args:
+            game_dir: 游戏安装目录；为 ``None`` 时只按进程名匹配。
+
+        Returns:
+            每个匹配进程一个字典，含 ``pid`` / ``name`` / ``username`` /
+            ``cmdline`` / ``create_time`` / ``running_seconds``。任何单个
+            进程读取失败都被跳过，不会中断整体扫描。
+        """
+        targets = {name.lower() for name in self.game_process_names}
+        needle = str(game_dir).lower() if game_dir else ""
+        found: list[dict[str, Any]] = []
+        now = datetime.now()
+
+        for proc in psutil.process_iter(["pid", "name", "username", "cmdline"]):
+            try:
+                info = proc.info
+                name = str(info.get("name") or "")
+                cmdline = [str(item) for item in (info.get("cmdline") or [])]
+                joined = " ".join(cmdline).lower()
+                matched = name.lower() in targets or (bool(needle) and needle in joined)
+                if not matched:
+                    continue
+                create_time = proc.create_time()
+                found.append(
+                    {
+                        "pid": info.get("pid"),
+                        "name": name,
+                        "username": info.get("username") or "",
+                        "cmdline": cmdline,
+                        "create_time": create_time,
+                        "running_seconds": max(0.0, now.timestamp() - create_time),
+                    }
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception as exc:  # noqa: BLE001 - 探测必须永不中断
+                self.logger.debug("读取进程信息失败: %s", exc)
+                continue
+        return found
+
+    def detect_install_locations(self) -> list[Path]:
+        """按平台惯例枚举可能的游戏安装位置。
+
+        解析顺序：
+
+        1. Windows：读取注册表卸载信息中的 ``InstallLocation`` /
+           ``UninstallString``，反推出可执行文件所在目录；
+        2. 平台常见路径（Windows Program Files / AppData，Linux
+           ``~/.local/share`` 与 ``/usr/share/games``，macOS ``/Applications``
+           与 ``~/Applications``）；
+        3. 配置的数据目录（``~/.dwrg/game``）。
+
+        所有平台分支都做了降级：注册表不可用（非 Windows 或权限不足）时
+        直接跳过，不会抛出异常。结果只保留真实存在且含已知可执行文件名
+        （见 :data:`GAME_EXECUTABLE_NAMES`）的目录，因此返回值可直接当作
+        「已发现的安装位置」使用。
+
+        Returns:
+            按优先级排列的**目录**路径列表，已去重且保持顺序。
+        """
+        candidates: list[Path] = []
+        for location in self._registry_install_locations():
+            candidates.append(location)
+        candidates.extend(self._default_install_locations())
+        return [
+            path
+            for path in self._dedupe_paths(candidates)
+            if self._contains_executable(path)
+        ]
+
+    def _contains_executable(self, directory: Path) -> bool:
+        """判断目录中是否存在已知的游戏可执行文件。
+
+        Args:
+            directory: 待检查的目录。
+
+        Returns:
+            目录存在且含任一已知可执行文件名时返回 ``True``。
+        """
+        if not directory.is_dir():
+            return False
+        return any((directory / name).is_file() for name in GAME_EXECUTABLE_NAMES)
+
+    def _registry_install_locations(self) -> list[Path]:
+        """从 Windows 注册表卸载信息反推安装目录。
+
+        Returns:
+            目录路径列表；非 Windows 平台或读取失败时返回空列表。
+        """
+        if self.platform != "windows":
+            return []
+        try:
+            winreg: Any = importlib.import_module("winreg")
+        except (ImportError, OSError) as exc:  # pragma: no cover - 依平台而定
+            self.logger.debug("无法导入 winreg，跳过注册表探测: %s", exc)
+            return []
+
+        roots: list[int] = []
+        for attribute in ("HKEY_LOCAL_MACHINE", "HKEY_CURRENT_USER"):
+            value = getattr(winreg, attribute, None)
+            if isinstance(value, int):
+                roots.append(value)
+        if not roots:  # pragma: no cover - 极端平台
+            return []
+
+        locations: list[Path] = []
+        for root in roots:
+            for sub_key in _WINDOWS_UNINSTALL_KEYS:
+                locations.extend(self._scan_uninstall_key(winreg, root, sub_key))
+        return locations
+
+    def _scan_uninstall_key(self, winreg: Any, root: int, sub_key: str) -> list[Path]:
+        """扫描单个卸载信息根键下的所有子项。
+
+        Args:
+            winreg: 已导入的 ``winreg`` 模块。
+            root: 注册表根键句柄。
+            sub_key: 卸载信息键路径。
+
+        Returns:
+            从 ``InstallLocation`` / ``UninstallString`` 推出的目录列表。
+        """
+        found: list[Path] = []
+        try:
+            with winreg.OpenKey(root, sub_key) as key:
+                total = winreg.QueryInfoKey(key)[0]
+                for index in range(total):
+                    try:
+                        child_name = winreg.EnumKey(key, index)
+                    except OSError:  # pragma: no cover - 并发删除子项
+                        continue
+                    found.extend(
+                        self._read_uninstall_entry(winreg, root, sub_key, child_name)
+                    )
+        except OSError as exc:
+            self.logger.debug("读取注册表 %s 失败: %s", sub_key, exc)
+            return found
+        return found
+
+    def _read_uninstall_entry(
+        self, winreg: Any, root: int, sub_key: str, child_name: str
+    ) -> list[Path]:
+        """读取单个卸载项并反推其安装目录。
+
+        Args:
+            winreg: 已导入的 ``winreg`` 模块。
+            root: 注册表根键句柄。
+            sub_key: 卸载信息键路径。
+            child_name: 子项名称（通常是 GUID 或程序名）。
+
+        Returns:
+            该卸载项指示的目录列表；信息不含路径时返回空列表。
+        """
+        path = f"{sub_key}\\{child_name}"
+        try:
+            with winreg.OpenKey(root, path) as entry:
+                values: list[str] = []
+                for value_name in ("InstallLocation", "UninstallString"):
+                    try:
+                        values.append(str(winreg.QueryValueEx(entry, value_name)[0]))
+                    except OSError:
+                        continue
+        except OSError as exc:
+            self.logger.debug("读取卸载项 %s 失败: %s", path, exc)
+            return []
+
+        result: list[Path] = []
+        for raw in values:
+            cleaned = raw.strip().strip('"')
+            if not cleaned:
+                continue
+            candidate = Path(cleaned).expanduser()
+            if candidate.suffix.lower() in {".exe", ".bat", ".cmd"}:
+                candidate = candidate.parent
+            if candidate.is_dir():
+                result.append(candidate)
+        return result
+
+    def _default_install_locations(self) -> list[Path]:
+        """返回平台惯例上的常见安装目录。
+
+        Returns:
+            候选目录列表（不保证存在）。
+        """
+        home = Path.home()
+        candidates: list[Path] = []
+
+        if self.platform == "windows":
+            program_dirs = [
+                Path(os.environ.get("ProgramFiles", "C:\\Program Files")),
+                Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")),
+                Path(os.environ.get("ProgramW6432", "C:\\Program Files")),
+            ]
+            for folder in (
+                "IdentityV",
+                "Identity V",
+                "dwrg",
+                "NetEase Games",
+            ):
+                candidates.extend(directory / folder for directory in program_dirs)
+            local = Path(
+                os.environ.get("LOCALAPPDATA", str(home / "AppData" / "Local"))
+            )
+            candidates.extend(
+                [
+                    local / "IdentityV",
+                    local / "NetEase" / "IdentityV",
+                    home / "AppData" / "Local" / "IdentityV",
+                ]
+            )
+        elif self.platform == "darwin":
+            candidates.extend(
+                [
+                    Path("/Applications") / "IdentityV.app",
+                    Path("/Applications") / "Identity V.app",
+                    home / "Applications" / "IdentityV.app",
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    home / ".local" / "share" / "IdentityV",
+                    home / ".local" / "share" / "games" / "IdentityV",
+                    home / "Games" / "IdentityV",
+                    Path("/usr/share/games") / "IdentityV",
+                    Path("/usr/local/share/games") / "IdentityV",
+                    Path("/opt") / "IdentityV",
+                ]
+            )
+
+        candidates.append(home / ".dwrg" / "game")
+        return candidates
+
+    @staticmethod
+    def _dedupe_paths(paths: list[Path]) -> list[Path]:
+        """按首次出现顺序去重路径。
+
+        Args:
+            paths: 可能重复的路径列表。
+
+        Returns:
+            去重后的路径列表（不存在的路径也保留，交由调用方判断）。
+        """
+        seen: set[str] = set()
+        result: list[Path] = []
+        for item in paths:
+            key = str(item).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def free_space_bytes(path: str | Path) -> int:
+        """返回路径所在文件系统的可用字节数。
+
+        Args:
+            path: 目标路径（文件或目录均可）。
+
+        Returns:
+            可用字节数；无法读取时返回 ``0``。
+        """
+        target = Path(path).expanduser()
+        try:
+            return shutil.disk_usage(target).free
+        except OSError:
+            # 目标尚不存在时退回到最近的父目录再试一次
+            try:
+                return shutil.disk_usage(target.parent).free
+            except OSError:
+                return 0
+
+    @staticmethod
+    def is_writable(path: str | Path) -> bool:
+        """判断目录是否可写。
+
+        采用「写临时文件」的实测方式，而不是 ``os.access``：后者在 Windows 上
+        对只读目录仍可能返回 ``True``，无法反映真实写入能力。
+
+        Args:
+            path: 目标目录；不存在时返回 ``False``。
+
+        Returns:
+            可写入返回 ``True``。
+        """
+        target = Path(path).expanduser()
+        if not target.is_dir():
+            return False
+        probe = target / f".dwrg-write-test-{os.getpid()}"
+        try:
+            probe.write_text("", encoding="utf-8")
+        except OSError:
+            return False
+        finally:
+            try:
+                probe.unlink()
+            except OSError:  # pragma: no cover - 尽力清理
+                pass
+        return True
+
+    @staticmethod
+    def key_file_mode_ok(path: str | Path) -> bool:
+        """判断密钥文件权限是否为 0600（仅属主可读写）。
+
+        Windows 上 POSIX 权限位由文件系统映射得到，因此这里放宽为
+        「不存在组/其他读写位」；POSIX 平台则严格要求 ``0600``。
+
+        Args:
+            path: 密钥文件路径。
+
+        Returns:
+            权限合规返回 ``True``；文件不存在或读取失败时返回 ``False``。
+        """
+        target = Path(path).expanduser()
+        try:
+            mode = stat.S_IMODE(os.stat(target).st_mode)
+        except OSError:
+            return False
+        if os.name == "nt":
+            return not (
+                mode & (stat.S_IRGRP | stat.S_IWGRP | stat.S_IROTH | stat.S_IWOTH)
+            )
+        return mode == 0o600
+
     def kill_process(self, pid: int, *, force: bool = False) -> bool:
         """终止指定进程。
 
@@ -431,4 +792,4 @@ class SystemManager:
         return f"{size:.2f} PB"
 
 
-__all__ = ["GAME_PROCESS_NAMES", "SystemManager"]
+__all__ = ["GAME_EXECUTABLE_NAMES", "GAME_PROCESS_NAMES", "SystemManager"]

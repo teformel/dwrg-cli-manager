@@ -1,7 +1,7 @@
 # 项目结构说明
 
 > 本文件描述**当前仓库的真实结构**。修改目录后请同步更新。
-> 最后校准：2026-10-03（对应提交 `0d0faa9`）。
+> 最后校准：2026-10-16（新墟 checkout / transports / session / updater 等模块）。
 
 ## 目录结构
 
@@ -17,13 +17,19 @@ dwrg-cli-manager/
 │   │   └── manager.py              # ConfigManager（原子写入 YAML/JSON）
 │   ├── accounts/                   # 账号管理
 │   │   ├── models.py               # Account / LoginResult（运行时视图）
+│   │   ├── session.py              # 登录态读写（session.json，0600）
+│   │   ├── transfer.py             # 加密导出 / 导入账号
+│   │   ├── gacha.py                # 扫描日志提取抽卡记录链接
 │   │   └── manager.py              # AccountManager（CRUD / 切换 / 认证）
 │   ├── servers/                    # 渠道服管理
 │   │   ├── models.py               # ServerStatus / ServerManagerConfig（ServerConfig 再导出）
 │   │   ├── detection.py            # 渠道服探测的辅助入口
+│   │   ├── checkout.py             # ChannelSwitcher：秒级切换 / sync / download
+│   │   │                           #   + 差异缓存与渠道配置备份
 │   │   └── manager.py              # ServerManager（同步 CRUD + 异步探测）
 │   ├── resources/                  # 资源管理
 │   │   ├── models.py               # 资源清单与校验结果模型
+│   │   ├── transports.py            # HttpIndexTransport / LocalIndexTransport
 │   │   ├── downloader.py           # 并发下载 + 断点续传
 │   │   ├── validator.py            # MD5 / 大小校验
 │   │   ├── patcher.py              # 渠道服差异文件应用
@@ -43,6 +49,8 @@ dwrg-cli-manager/
 │   │   ├── crypto.py               # Fernet 密钥管理 + PBKDF2 密码哈希
 │   │   └── validation.py           # validate_username / validate_password 等
 │   └── utils/                      # 通用工具
+│       ├── atomic.py               # atomic_write_text（临时文件 + os.replace + chmod）
+│       ├── updater.py              # 版本检查与升级提示（PyPI）
 │       ├── logger.py               # setup_logging / get_logger（stdlib logging）
 │       ├── system.py               # SystemManager（系统 / 磁盘 / 进程信息）
 │       ├── network.py              # fetch_json / ping_server / check_server_status
@@ -143,6 +151,9 @@ dwrg-cli-manager/
 
 - **`tests/unit/`**：与 `src/dwrg_manager` 下的模块一一对应，覆盖正常 / 边界 / 异常路径，
   异常统一用 `pytest.raises` 断言具体类型。全部标 `@pytest.mark.unit`。
+  其中 `test_checkout.py` 专门覆盖秒级切换：首次切换建缓存、二次切换走缓存
+  不触网、缓存损坏回落下载、大版本变化重置缓存、`sync` 四种状态、
+  目录穿越防护等；下载器通过注入不触网的假代身驱动。
 - **`tests/integration/`**：以 `CliRunner` 跑完整命令序列（建配置 → 加渠道服 → 加账号 →
   切换 → 导出 / 导入 → status），标 `@pytest.mark.integration`。
 - **`tests/performance/`**：导入耗时预算与大量渠道服下的列表规模，标

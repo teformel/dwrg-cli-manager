@@ -2,18 +2,21 @@
 资源管理器
 
 作为资源领域的唯一对外入口，``ResourceManager`` 只负责「装配」：
-选择服务器、获取清单、调用 :class:`~dwrg_manager.resources.validator.Validator`
+选择资源源、获取清单、调用 :class:`~dwrg_manager.resources.validator.Validator`
 做文件体检、调用 :class:`~dwrg_manager.resources.patcher.Patcher` 做增量更新，
 并对外暴露缓存统计与清理。真正的下载/校验/比对逻辑分别位于
 ``downloader`` / ``validator`` / ``patcher`` 三个子模块。
+
+资源源不再内置任何编造域名，全部来自 ``AppConfig.resource_sources``
+（默认预置两条已实测的国际服直链），因此用户可自行覆盖；国服 PC 端
+公开直链已关闭，只能通过 ``--dir`` 指定本地已安装目录走
+:class:`~dwrg_manager.resources.transports.LocalIndexTransport`。
 """
 
 import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import aiohttp
 
 from ..config.manager import ConfigManager
 from ..utils.logger import get_logger
@@ -28,48 +31,17 @@ from .models import (
     ResourceUpdateResult,
 )
 from .patcher import Patcher
+from .transports import HttpIndexTransport, LocalIndexTransport
 from .validator import Validator
 
 logger = get_logger(__name__)
 
+#: 清单来源模式：``auto``（本地清单优先，其次 HTTP 索引）、``local``、``http``。
+SOURCE_MODES: tuple[str, ...] = ("auto", "local", "http")
 
-class AiohttpManifestTransport:
-    """基于 aiohttp 的默认清单提供者。"""
-
-    def __init__(self, timeout: int = 30) -> None:
-        """初始化传输层。
-
-        Args:
-            timeout: 获取清单的请求总超时（秒）。
-        """
-        self._timeout = timeout
-
-    async def fetch_manifest(self, server: ResourceServer) -> ResourceManifest | None:
-        """从服务器的 ``manifest.json`` 拉取并解析清单。
-
-        Args:
-            server: 目标资源服务器。
-
-        Returns:
-            解析成功返回 :class:`ResourceManifest`，失败返回 ``None``。
-        """
-        url = f"{server.base_url.rstrip('/')}/manifest.json"
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        logger.error("获取清单失败: HTTP %s (%s)", response.status, url)
-                        return None
-                    data = await response.json()
-        except Exception as exc:  # noqa: BLE001 - 网络边界，统一降级为 None
-            logger.error("获取清单异常: %s (%s)", exc, url)
-            return None
-        try:
-            return ResourceManifest(**data)
-        except ValueError as exc:
-            logger.error("解析清单失败: %s", exc)
-            return None
+#: 本地清单被视为「未过期」的最大时长（秒）；超过该时长后 ``auto`` 模式
+#: 会重新走 HTTP 索引刷新。
+DEFAULT_MANIFEST_TTL_SECONDS = 24 * 60 * 60
 
 
 class ResourceManager:
@@ -80,13 +52,20 @@ class ResourceManager:
         config_manager: ConfigManager | None = None,
         *,
         transport: ManifestTransport | None = None,
+        source: str = "auto",
+        game_dir: Path | str | None = None,
     ) -> None:
         """初始化资源管理器。
 
         Args:
             config_manager: 配置管理器；缺省使用默认配置。传入的配置决定
                 ``data_dir`` / ``cache_dir`` / 并发数 / 超时等。
-            transport: 清单提供者；缺省走 aiohttp，测试可注入假实现。
+            transport: 清单提供者；缺省按 ``source`` 自动选择，测试可注入假实现。
+                一旦显式传入，``source`` 与自动选择逻辑都不再生效。
+            source: 清单来源模式，取值见 :data:`SOURCE_MODES`；``auto`` 表示
+                「本地清单优先（存在且未过期），其次 HTTP 索引」。
+            game_dir: 显式指定游戏目录；``None`` 时依次取 ``app.game_path``
+                与 ``data_dir/game``。
 
         Example:
             >>> manager = ResourceManager(ConfigManager("/tmp/c.yaml"))
@@ -98,10 +77,11 @@ class ResourceManager:
 
         self.data_dir = Path(app_config.data_dir).expanduser()
         self.cache_dir = Path(app_config.cache_dir).expanduser()
-        self.game_dir = self.data_dir / "game"
+        self.game_dir = self._resolve_game_dir(app_config, game_dir)
         for directory in (self.data_dir, self.cache_dir, self.game_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+        self.source = source if source in SOURCE_MODES else "auto"
         self.resource_servers = self._init_resource_servers()
         self.validator = Validator()
         self.downloader = Downloader(
@@ -113,55 +93,135 @@ class ResourceManager:
             game_dir=self.game_dir,
             validator=self.validator,
         )
-        self.transport = transport or AiohttpManifestTransport()
+        self._injected_transport = transport
+        self.transport: ManifestTransport | None = None
 
-    def _init_resource_servers(self) -> list[ResourceServer]:
-        """初始化内置资源服务器列表。
+    @staticmethod
+    def _resolve_game_dir(app_config: Any, override: Path | str | None) -> Path:
+        """解析实际使用的游戏目录。
 
-        Returns:
-            主用与备用两个 :class:`ResourceServer`。
-        """
-        return [
-            ResourceServer(
-                name="official",
-                endpoint="https://resources.identityv.com",
-                base_url="https://resources.identityv.com/v1",
-                current_version="1.0.0",
-                latest_version="1.0.0",
-                is_available=True,
-            ),
-            ResourceServer(
-                name="backup",
-                endpoint="https://backup.resources.identityv.com",
-                base_url="https://backup.resources.identityv.com/v1",
-                current_version="1.0.0",
-                latest_version="1.0.0",
-                is_available=True,
-            ),
-        ]
-
-    def _select_server(self, server: str | None) -> ResourceServer | None:
-        """按名称选择资源服务器。
+        优先级：显式参数 ``override`` → ``app.game_path`` → ``data_dir/game``。
 
         Args:
-            server: 服务器名称；``None`` 表示使用第一个（主用）服务器。
+            app_config: 应用级配置对象。
+            override: 显式指定的游戏目录；``None`` 表示不覆盖。
+
+        Returns:
+            展开用户目录后的绝对路径。
+        """
+        if override:
+            return Path(override).expanduser()
+        configured = str(getattr(app_config, "game_path", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        return Path(app_config.data_dir).expanduser() / "game"
+
+    def _init_resource_servers(self) -> list[ResourceServer]:
+        """从配置构造资源服务器（即资源源）列表。
+
+        不再内置任何编造域名；每个条目对应 ``AppConfig.resource_sources``
+        中的一条配置，名称与渠道均可由用户覆盖。
+
+        Returns:
+            来自配置的 :class:`ResourceServer` 列表；配置为空时返回空列表。
+        """
+        app_config = self.config_manager.get_app_config()
+        servers: list[ResourceServer] = []
+        for source_config in app_config.resource_sources:
+            servers.append(
+                ResourceServer(
+                    name=source_config.name,
+                    endpoint=source_config.url,
+                    base_url=source_config.url.rsplit("/", 1)[0],
+                    current_version=source_config.description or source_config.name,
+                    latest_version=source_config.description or source_config.name,
+                    is_available=source_config.is_available,
+                )
+            )
+        return servers
+
+    def _select_server(self, server: str | None) -> ResourceServer | None:
+        """按名称选择资源服务器（即资源源）。
+
+        Args:
+            server: 资源源名称；``None`` 表示使用第一个可用源。
 
         Returns:
             匹配的 :class:`ResourceServer`；未找到返回 ``None``。
         """
         if server is None:
-            return self.resource_servers[0] if self.resource_servers else None
+            for candidate in self.resource_servers:
+                if candidate.is_available:
+                    return candidate
+            return None
         for candidate in self.resource_servers:
             if candidate.name == server:
                 return candidate
-        logger.error("服务器不存在: %s", server)
+        logger.error("资源源不存在: %s", server)
         return None
 
+    def _build_transport(self) -> ManifestTransport:
+        """按来源模式构造默认传输层。
+
+        Returns:
+            ``local`` 模式返回 :class:`LocalIndexTransport`；
+            其余返回 :class:`HttpIndexTransport`。
+        """
+        if self.source == "local":
+            return LocalIndexTransport(directory=self.game_dir)
+        return HttpIndexTransport(
+            sources=self.config_manager.get_app_config().resource_sources,
+            timeout=self.config_manager.get_app_config().download_timeout,
+        )
+
+    def _get_transport(self) -> ManifestTransport:
+        """返回当前生效的传输层（懒构造并缓存）。
+
+        Returns:
+            测试注入的替身，或按 ``source`` 构造的默认实现。
+        """
+        if self._injected_transport is not None:
+            return self._injected_transport
+        if self.transport is None:
+            self.transport = self._build_transport()
+        return self.transport
+
+    def _is_local_manifest_fresh(self) -> bool:
+        """判断本地清单文件是否存在且未过期。
+
+        Returns:
+            清单存在且修改时间在 :data:`DEFAULT_MANIFEST_TTL_SECONDS` 之内时
+            返回 ``True``。
+        """
+        manifest_path = self.patcher.manifest_path
+        try:
+            if not manifest_path.is_file():
+                return False
+            age = datetime.now().timestamp() - manifest_path.stat().st_mtime
+        except OSError as exc:
+            logger.warning("读取本地清单时间失败: %s (%s)", manifest_path, exc)
+            return False
+        return age < DEFAULT_MANIFEST_TTL_SECONDS
+
+    def _load_local_manifest(self) -> ResourceManifest | None:
+        """读取本地已记录的清单。
+
+        Returns:
+            解析成功返回 :class:`ResourceManifest`；不存在或损坏返回 ``None``。
+        """
+        return self.patcher.load_manifest()
+
     async def _get_manifest(self, server: str | None = None) -> ResourceManifest | None:
-        """获取资源清单（含服务器选择与异常降级）。
+        """获取资源清单（含来源模式、服务器选择与异常降级）。
+
+        ``auto`` 模式的优先级：
+
+        1. 注入的 ``transport``（测试替身，行为与旧版完全一致）；
+        2. 本地清单（``data_dir/manifest.json`` 存在且未过期）；
+        3. HTTP 索引（对配置的资源源发 ``HEAD``）。
 
         Args:
-            server: 服务器名称。
+            server: 资源源名称。
 
         Returns:
             清单；无法获取时返回 ``None``。
@@ -169,8 +229,19 @@ class ResourceManager:
         selected = self._select_server(server)
         if selected is None:
             return None
+
+        if self._injected_transport is None:
+            if self.source == "local":
+                return await self._get_transport().fetch_manifest(selected)
+            if self.source == "auto" and self._is_local_manifest_fresh():
+                local_manifest = self._load_local_manifest()
+                if local_manifest is not None:
+                    logger.info("使用本地清单: %s", self.patcher.manifest_path)
+                    return local_manifest
+                logger.info("本地清单损坏，回落到 HTTP 索引")
+
         try:
-            return await self.transport.fetch_manifest(selected)
+            return await self._get_transport().fetch_manifest(selected)
         except Exception as exc:  # noqa: BLE001 - 传输层异常统一降级为 None
             logger.error("获取资源清单异常: %s", exc)
             return None
@@ -202,7 +273,7 @@ class ResourceManager:
         """检查游戏资源完整性。
 
         Args:
-            server: 服务器名称；``None`` 使用主用服务器。
+            server: 资源源名称；``None`` 使用第一个可用源。
 
         Returns:
             :class:`ResourceCheckResult`。清单拉取失败时返回全 0 结果并记录错误日志。
@@ -247,7 +318,7 @@ class ResourceManager:
         """更新游戏资源。
 
         Args:
-            server: 服务器名称；``None`` 使用主用服务器。
+            server: 资源源名称；``None`` 使用第一个可用源。
             force: 为 ``True`` 时忽略「版本未变」短路，改为按磁盘现状做修复式更新
                 （重新下载缺失/损坏文件）。
 

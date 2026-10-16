@@ -628,7 +628,193 @@ dwrg server set-default bserver
 ✓ 默认渠道服已设置为 bserver
 ```
 
-## 五、资源管理 `dwrg resource`
+
+## 五、秒级切换 `dwrg checkout` / `dwrg sync` / `dwrg download`
+
+这三个顶层命令对标 `wutheringwaves-cli-manager` 的 `ww checkout` / `ww sync` /
+`ww download`，核心是**差异缓存**：首次切换时把当前渠道服的文件快照进
+`<游戏目录>/dwrg_server_diff_cache/<渠道服>/`，之后任意切换优先从本地缓存恢复，
+不触网、秒级完成；缓存不可用或 `--force-sync` 时才回落下载。
+
+缓存元数据记录在 `<游戏目录>/dwrg_server_diff_cache/<渠道服>/cache_meta.json`，
+其中包含 `version` 字段：游戏目录下 `version` 文件内容变化（大版本更新）时会
+**自动重置整个差异缓存**，避免把旧版本文件错贴到新版本上。
+
+### 1. `dwrg checkout`
+
+秒级切换渠道服。
+
+**语法**
+
+```text
+dwrg checkout [OPTIONS] SERVER
+```
+
+| 参数 / 选项 | 短写 | 类型 | 默认 | 说明 |
+|-------------|------|------|------|------|
+| `SERVER` | — | `TEXT` | — | 目标渠道服名称（必需） |
+| `--path` | `-p` | `TEXT` | `None` | 游戏目录；省略时读取配置中的 `game_path`，再回落到 `data_dir/game` |
+| `--force-sync` | — | 布尔 | `False` | 跳过缓存，强制走全量下载 |
+| `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
+
+**行为**
+
+| 场景 | 结果模式 | 说明 |
+|------|----------|------|
+| 目标即当前渠道服 | 无需切换 | 只更新快照，不改动任何文件 |
+| 两服都有缓存 | 缓存恢复 | 秒级，不触发下载 |
+| 只有一服有缓存 | 下载 | 下载缺失文件并回写缓存 |
+| 大版本变化 | 下载 | 先自动重置差异缓存，再下载 |
+
+**示例**
+
+```bash
+dwrg checkout bserver -p "$HOME/Games/IdentityV"
+```
+
+```text
+✓ 已切换到 bserver（模式：下载）
+  切换前渠道服: official
+  下载 2 个文件
+```
+
+再次切回即可体验秒级缓存路径：
+
+```bash
+dwrg checkout official -p "$HOME/Games/IdentityV"
+```
+
+```text
+✓ 已切换到 official（模式：缓存恢复）
+  切换前渠道服: bserver
+  从缓存恢复 2 个文件
+```
+
+**失败与保护**
+
+| 情况 | 行为 |
+|------|------|
+| 目标渠道服不存在 | 抛出 `ServerError`，列出可用渠道服，退出码 1 |
+| 已识别渠道服但找不到渠道配置文件 | 直接失败，提示确认游戏目录 |
+| 下载失败 | 返回失败结果，**不写缓存**，退出码 1 |
+| 缓存路径越界（如 `../`） | 拒绝恢复并回落下载，不会写出游戏目录 |
+
+切换前一定会先备份渠道配置文件（`KRSDKConfig.json` / `*channel*.json` 等，
+存放于 `<游戏目录>/dwrg_server_config_backup/`），失败即中止，不会留下
+「切了一半」的中间态。
+
+### 2. `dwrg sync`
+
+全量校验本地客户端文件，报告（可选修复）损坏与缺失。
+
+**语法**
+
+```text
+dwrg sync [OPTIONS]
+```
+
+| 选项 | 短写 | 类型 | 默认 | 说明 |
+|------|------|------|------|------|
+| `--path` | `-p` | `TEXT` | `None` | 游戏目录；省略时读取配置 |
+| `--repair` | — | 布尔 | `False` | 从本地差异缓存修复损坏 / 缺失文件 |
+| `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
+
+校验基准是差异缓存中**同渠道服**的快照：缓存里没有对应文件时只校验存在性，
+有对应文件时比对 MD5。
+
+**示例**
+
+```bash
+dwrg sync -p "$HOME/Games/IdentityV" --repair
+```
+
+```text
+┌──────────┬────┐
+│ 检查项   │ 值 │
+├──────────┼────┤
+│ 版本     │ 19 │
+│ 文件总数 │ 2  │
+│ 健康     │ 2  │
+│ 损坏     │ 0  │
+│ 缺失     │ 0  │
+│ 已修复   │ 0  │
+└──────────┴────┘
+✓ 所有文件校验通过
+```
+
+无法识别当前渠道服时命令失败并提示先执行 `dwrg checkout`。
+
+### 3. `dwrg download`
+
+从零下载指定渠道服的客户端框架文件。下载成功后会把文件写回差异缓存、
+应用渠道配置并记住游戏目录，使后续 `dwrg checkout` 可以秒级完成。
+
+**语法**
+
+```text
+dwrg download [OPTIONS] SERVER
+```
+
+| 参数 / 选项 | 短写 | 类型 | 默认 | 说明 |
+|-------------|------|------|------|------|
+| `SERVER` | — | `TEXT` | — | 目标渠道服名称（必需） |
+| `--path` | `-p` | `TEXT` | `None` | 下载目录；省略时读取配置 |
+| `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
+
+**示例**
+
+```bash
+dwrg download official -p "$HOME/Games/IdentityV"
+```
+
+```text
+✓ 已下载 2 个文件到 C:\Users\me\Games\IdentityV（4096 字节）
+```
+
+### 4. 与 `dwrg resource` 的分工
+
+| 命令 | 负责 |
+|------|------|
+| `dwrg checkout` / `sync` / `download` | 渠道服级别的文件切换、差异缓存与渠道配置管理 |
+| `dwrg resource index` / `check` / `update` | 逐文件资源清单（path / size / md5）的生成、校验与增量下载 |
+
+两者共用 `resources.validator` 的哈希实现与 `resources.downloader` 的下载能力，
+但不重复实现传输层。
+
+## 六、资源管理 `dwrg resource`
+
+### 0. `dwrg resource index`
+
+扫描本地目录生成资源清单（path / size / md5）。
+
+清单默认写入 `<目录>/manifest.json`（原子写入：临时文件 +
+`os.replace`），也可用 `--output` 指定其他路径。
+
+**语法**
+
+```text
+dwrg resource index [OPTIONS] DIR
+```
+
+| 参数 / 选项 | 类型 | 默认 | 说明 |
+|-------------|------|------|------|
+| `DIR` | `TEXT` | — | 待扫描的游戏目录（必需） |
+| `--output` | `-o` | `TEXT` | `None` | 清单输出路径；缺省为 `<目录>/manifest.json` |
+| `--force` | `-f` | 布尔 | `False` | 目标已存在也强制重新生成 |
+| `--config` | — | `TEXT` | `None` | 自定义配置文件路径 |
+
+**示例**
+
+```bash
+dwrg resource index "$HOME/Games/IdentityV" -o idv-manifest.json
+```
+
+```text
+✓ 资源索引已生成: idv-manifest.json（12 个文件，4096000 字节）
+```
+
+扫描会跳过 `*.part` / `*.tmp` 与 `manifest.json` 本身，避免把下载中的临时文件
+编进清单。
 
 ### 1. `dwrg resource check`
 
@@ -746,7 +932,7 @@ dwrg resource info
  游戏大小      0.00 B
 ```
 
-## 六、启动管理 `dwrg launch`
+## 七、启动管理 `dwrg launch`
 
 `launch` 是唯一带回调（callback）的命令组：`invoke_without_command=True`，因此**不带子命令**时直接执行启动逻辑。
 
@@ -837,7 +1023,7 @@ dwrg launch status
 ! 游戏未在本会话中运行
 ```
 
-## 七、配置管理 `dwrg config`
+## 八、配置管理 `dwrg config`
 
 ### 1. `dwrg config show`
 
@@ -1030,7 +1216,7 @@ dwrg config import backup.json
 
 > 导入格式按**文件扩展名**判断：`.json` 走 JSON，其余走 YAML。
 
-## 八、插件管理 `dwrg plugin`
+## 九、插件管理 `dwrg plugin`
 
 插件子命令**不支持** `--config`，改用 `--plugin-dir` 指定插件目录（默认 `~/.dwrg/plugins`）。
 
@@ -1130,3 +1316,87 @@ dwrg plugin enable my-plugin
 ```
 
 > `dwrg plugin` 目前仅提供 `list` / `info` / `enable` / `disable`，**没有** `install` / `uninstall` 子命令；插件通过将文件放入插件目录来「安装」。
+
+## 十、抽卡记录 `dwrg gacha`
+
+扫描游戏日志目录，提取抽卡记录链接（对标 `ww log`）。
+
+**语法**
+
+```text
+dwrg gacha [OPTIONS]
+dwrg gacha scan [OPTIONS]
+```
+
+`dwrg gacha` 与 `dwrg gacha scan` 完全等价。
+
+| 选项 | 短写 | 类型 | 默认 | 说明 |
+|------|------|------|------|------|
+| `--dir` | `-p` | `TEXT` | `None` | 游戏日志目录；缺省按平台自动探测 |
+| `--open` | `-o` | 布尔 | `False` | 在默认浏览器中打开第一条链接 |
+
+**平台默认日志目录**
+
+| 平台 | 路径 |
+|------|------|
+| Windows | `%LOCALAPPDATA%\IdentityV` |
+| macOS | `~/Library/Application Support/IdentityV` |
+| Linux | `~/.IdentityV` |
+
+**示例**
+
+```bash
+dwrg gacha
+```
+
+```text
+┌──────┬─────────────────────────────────────┐
+│ 序号   抽卡记录链接                            │
+├──────┼─────────────────────────────────────┤
+│ 1      https://gacha.identityv.com/record?id=xxx      │
+└──────┴─────────────────────────────────────┘
+共 1 条链接，扫描目录 C:\Users\me\AppData\Local\IdentityV（18 个文件）
+```
+
+日志被客户端加密时，命令输出提示而不报错：
+
+```text
+! 日志已被客户端加密，无法提取抽卡记录链接
+```
+
+## 十一、自更新 `dwrg self-update`
+
+检查 PyPI 上的最新版本（对标 `ww update` 的版本检查部分）。
+
+**语法**
+
+```text
+dwrg self-update [OPTIONS]
+```
+
+| 选项 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `--check` | 布尔 | `False` | 只检查是否有新版本，不执行更新 |
+| `--config` | `TEXT` | `None` | 自定义配置文件路径（保留供统一） |
+
+**示例**
+
+```bash
+dwrg self-update --check
+```
+
+```text
+当前版本: 1.0.0
+最新版本: 1.1.0
+! 发现新版本 1.1.0，可执行 dwrg self-update 升级
+```
+
+发现新版本时，命令会打印可直接复制的升级命令：
+
+```text
+✓ uv tool install -U dwrg-cli-manager
+✓ pip install -U dwrg-cli-manager
+```
+
+离线或查询失败时仅输出警告，**不会导致命令失败**（退出码 0）。
+
