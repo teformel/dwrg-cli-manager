@@ -25,7 +25,7 @@ from dwrg_manager.launcher import (
     LaunchResult,
 )
 from dwrg_manager.launcher import manager as launcher_manager_module
-from dwrg_manager.launcher.manager import default_game_candidates
+from dwrg_manager.launcher.manager import MIN_FREE_BYTES, default_game_candidates
 from dwrg_manager.utils.system import SystemManager
 
 
@@ -280,6 +280,9 @@ class TestLaunch:
         monkeypatch.setattr(launcher_manager_module.subprocess, "Popen", _FakePopen)
         monkeypatch.setattr(
             launcher_manager_module.psutil, "Process", lambda pid: _FakeProcess(pid)
+        )
+        monkeypatch.setattr(
+            launcher.system_manager, "free_space_bytes", lambda _path: MIN_FREE_BYTES
         )
 
         result = launcher.launch()
