@@ -1,7 +1,7 @@
 # 项目结构说明
 
 > 本文件描述**当前仓库的真实结构**。修改目录后请同步更新。
-> 最后校准：2026-10-16（新墟 checkout / transports / session / updater 等模块）。
+> 最后校准：2026-10-16（新增 checkout / transports / session / updater 等模块）。
 
 ## 目录结构
 
@@ -61,7 +61,7 @@ dwrg-cli-manager/
 ├── tests/                          # 测试
 │   ├── conftest.py                 # 隔离 HOME / 密钥 / 配置的公共 fixture
 │   ├── README.md                   # 如何跑测试
-│   ├── unit/                       # 单元测试（11 个模块，逐个对应源码模块）
+│   ├── unit/                       # 单元测试（14 个测试文件，逐一对应源码模块）
 │   ├── integration/                # 端到端 CLI 流程
 │   └── performance/                # 导入耗时与规模测试（标 slow）
 ├── docs/                           # MkDocs Material 文档（12 篇）

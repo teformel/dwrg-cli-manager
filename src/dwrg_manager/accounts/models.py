@@ -24,8 +24,10 @@ class Account(BaseModel):
     id: str = Field(..., description="账号ID")
     username: str = Field(..., description="用户名")
     server: str = Field(..., description="渠道服")
-    encrypted_password: str = Field("", description="加密后的密码")
-    password_hash: str = Field("", description="密码哈希")
+    encrypted_password: str = Field(
+        "", description="加密后的密码", exclude=True, repr=False
+    )
+    password_hash: str = Field("", description="密码哈希", exclude=True, repr=False)
     created_at: datetime = Field(default_factory=datetime.now, description="创建时间")
     last_login: datetime | None = Field(None, description="最后登录时间")
     is_current: bool = Field(False, description="是否为当前账号")

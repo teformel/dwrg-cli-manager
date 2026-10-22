@@ -48,6 +48,22 @@ class TestAccountModel:
 
         assert account.display_id() == "01234567..."
 
+    def test_serialization_excludes_password_material(self) -> None:
+        """运行时视图序列化时不得泄露密文与哈希。"""
+        account = Account(
+            id=VALID_ID,
+            username="hero",
+            server="official",
+            encrypted_password="cipher-text",
+            password_hash="hash-value",
+        )
+
+        dumped = account.model_dump()
+        assert "encrypted_password" not in dumped
+        assert "password_hash" not in dumped
+        assert "cipher-text" not in repr(account)
+        assert "hash-value" not in repr(account)
+
 
 @pytest.mark.unit
 class TestLoginResult:

@@ -139,6 +139,8 @@ class TestCliWorkflow:
             app, ["account", "list", "-f", "json", "--config", str(new_config)]
         )
         assert "mage" in accounts.stdout
+        assert "encrypted_password" not in accounts.stdout
+        assert "password_hash" not in accounts.stdout
 
     def test_switch_server_updates_current_and_survives_reload(
         self, cli_runner: CliRunner, config_path: Path

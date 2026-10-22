@@ -6,6 +6,8 @@
 
 import asyncio
 import hashlib
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -491,6 +493,85 @@ async def test_manager_update_manifest_failure_is_explicit(tmp_path: Path) -> No
     assert result.success is False
     assert result.error
     assert result.downloaded_files == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_prefers_fresh_local_manifest(tmp_path: Path) -> None:
+    """auto 模式下未过期的本地清单优先，不构造 HTTP 传输层。"""
+    file_a = make_file("a.bin", b"hello")
+    local = make_manifest("1", [file_a])
+    manager = ResourceManager(make_config(tmp_path), source="auto")
+    manager.patcher.save_manifest(local)
+    (manager.game_dir / "a.bin").write_bytes(b"hello")
+
+    def fail_build() -> FakeTransport:
+        raise AssertionError("不应回落到 HTTP 索引")
+
+    manager._build_transport = fail_build  # type: ignore[method-assign]
+
+    result = await manager.check_resources()
+
+    assert result.total_files == 1
+    assert result.healthy_files == 1
+
+
+@pytest.mark.asyncio
+async def test_manager_auto_falls_back_when_local_manifest_stale(
+    tmp_path: Path,
+) -> None:
+    """本地清单过期时回落到传输层拉取新清单。"""
+    stale = make_manifest("1", [make_file("old.bin", b"old")])
+    remote = make_manifest("2", [make_file("new.bin", b"new")])
+    manager = ResourceManager(make_config(tmp_path), source="auto")
+    manager.patcher.save_manifest(stale)
+    manifest_path = manager.patcher.manifest_path
+    old_time = time.time() - 2 * 86400
+    os.utime(manifest_path, (old_time, old_time))
+
+    def build() -> FakeTransport:
+        return FakeTransport(remote)
+
+    manager._build_transport = build  # type: ignore[method-assign]
+
+    result = await manager.check_resources()
+
+    assert result.total_files == 1
+    assert result.missing_files == 1
+
+
+@pytest.mark.asyncio
+async def test_manager_force_repairs_from_disk_state(tmp_path: Path) -> None:
+    """force=True 时按磁盘现状重建下载计划，修复损坏与缺失文件。"""
+    good_data = b"good"
+    bad_data = b"bad!!"
+    missing_data = b"new!!"
+    remote = make_manifest(
+        "2",
+        [
+            make_file("a.bin", good_data),
+            make_file("b.bin", bad_data),
+            make_file("c.bin", missing_data),
+        ],
+    )
+    manager = ResourceManager(make_config(tmp_path), transport=FakeTransport(remote))
+    (manager.game_dir / "a.bin").write_bytes(good_data)
+    (manager.game_dir / "b.bin").write_bytes(b"broken")
+    factory, _stats = make_session_factory(
+        {
+            "https://example.test/v1/b.bin": bad_data,
+            "https://example.test/v1/c.bin": missing_data,
+        }
+    )
+    manager.downloader = Downloader(retries=1, retry_backoff=0, session_factory=factory)
+
+    result = await manager.update_resources(force=True)
+
+    assert result.success is True
+    assert result.downloaded_files == 2
+    assert result.updated_files == 1
+    assert result.total_size == len(bad_data) + len(missing_data)
+    assert (manager.game_dir / "b.bin").read_bytes() == bad_data
+    assert (manager.game_dir / "c.bin").read_bytes() == missing_data
 
 
 def test_manager_get_cache_info(tmp_path: Path) -> None:

@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ from dwrg_manager.exceptions import ServerError
 from dwrg_manager.utils import logger as logger_module
 from dwrg_manager.utils import network as network_module
 from dwrg_manager.utils import system as system_module
+from dwrg_manager.utils import updater as updater_module
 from dwrg_manager.utils.logger import default_log_file, get_logger, setup_logging
 from dwrg_manager.utils.network import (
     _timeout,
@@ -31,6 +33,19 @@ from dwrg_manager.utils.network import (
     ping_server,
 )
 from dwrg_manager.utils.system import SystemManager
+from dwrg_manager.utils.updater import (
+    STATUS_OUTDATED,
+    STATUS_UNKNOWN,
+    STATUS_UP_TO_DATE,
+    UPGRADE_COMMANDS,
+    WAIT_TIMEOUT,
+    UpdateChecker,
+    _is_prerelease,
+    _normalize,
+    build_upgrade_hint,
+    check_latest_version,
+    check_latest_version_async,
+)
 from dwrg_manager.utils.version import get_version
 
 
@@ -338,6 +353,153 @@ class TestVersion:
 
 
 @pytest.mark.unit
+class TestUpdateChecker:
+    """自更新检查的版本比较与静默降级。"""
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("1.2.3", (1, 2, 3)),
+            ("v2.0", (2, 0, 0)),
+            ("1.2.3rc1", (1, 2, 3)),
+            ("10.20.30", (10, 20, 30)),
+            ("abc", (0, 0, 0)),
+        ],
+    )
+    def test_normalize(self, version: str, expected: tuple[int, ...]) -> None:
+        """版本号应解析为三段整数元组，解析失败回落为零。"""
+        assert _normalize(version) == expected
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("1.0.0", False),
+            ("2.3.4", False),
+            ("1.0.0rc1", True),
+            ("1.0.0b2", True),
+            ("1.0.0.dev3", True),
+        ],
+    )
+    def test_is_prerelease(self, version: str, expected: bool) -> None:
+        """含预发布标记的版本应被识别。"""
+        assert _is_prerelease(version) is expected
+
+    def test_check_detects_outdated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """PyPI 版本更高时应报告 ``outdated``。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "1.1.0"}})
+
+        info = UpdateChecker(current="1.0.0").check()
+
+        assert info.status == STATUS_OUTDATED
+        assert info.latest == "1.1.0"
+        assert info.has_update is True
+
+    def test_check_reports_up_to_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """版本相同应报告 ``up-to-date``。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "1.0.0"}})
+
+        info = UpdateChecker(current="1.0.0").check()
+
+        assert info.status == STATUS_UP_TO_DATE
+        assert info.has_update is False
+
+    def test_check_degrades_when_offline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """网络异常应静默降级为 ``unknown``，不抛异常。"""
+        patch_pypi(monkeypatch, error=OSError("offline"))
+
+        info = UpdateChecker(current="1.0.0").check()
+
+        assert info.status == STATUS_UNKNOWN
+        assert info.latest is None
+        assert info.has_update is False
+
+    def test_check_marks_prerelease_as_no_update(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """最新版是预发布时不提示升级。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "2.0.0rc1"}})
+
+        info = UpdateChecker(current="1.0.0").check()
+
+        assert info.status == STATUS_OUTDATED
+        assert info.is_prerelease is True
+        assert info.has_update is False
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            [],
+            {},
+            {"info": None},
+            {"info": {}},
+            {"info": {"version": ""}},
+            {"info": {"version": 123}},
+        ],
+    )
+    def test_malformed_payload_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, payload: Any
+    ) -> None:
+        """响应结构不符合预期时按未知处理。"""
+        patch_pypi(monkeypatch, payload=payload)
+
+        assert UpdateChecker(current="1.0.0").check().status == STATUS_UNKNOWN
+
+    def test_check_latest_version_helper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """便捷函数应同步等待后台查询结果。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "2.0.0"}})
+
+        info = check_latest_version(current="1.0.0")
+
+        assert info.status == STATUS_OUTDATED
+        assert info.latest == "2.0.0"
+
+    def test_start_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """重复 ``start`` 返回同一个线程。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "1.0.0"}})
+        checker = UpdateChecker(current="1.0.0")
+
+        first = checker.start()
+        second = checker.start()
+
+        assert first is second
+        assert checker.wait().status == STATUS_UP_TO_DATE
+
+    def test_wait_returns_unknown_after_timeout(self) -> None:
+        """线程未在限定时间内完成时返回 ``unknown``。"""
+        checker = UpdateChecker(current="1.0.0")
+        stuck = _StuckThread()
+        checker._thread = stuck  # type: ignore[assignment]
+
+        info = checker.wait()
+
+        assert stuck.timeout == WAIT_TIMEOUT
+        assert info.status == STATUS_UNKNOWN
+
+    def test_async_helper_returns_started_checker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """异步入口应立即返回已启动的检查器。"""
+        patch_pypi(monkeypatch, payload={"info": {"version": "1.0.0"}})
+
+        checker = check_latest_version_async(current="1.0.0")
+
+        assert isinstance(checker, UpdateChecker)
+        assert checker.wait().status == STATUS_UP_TO_DATE
+
+    def test_default_current_uses_package_version(self) -> None:
+        """未显式传版本时应读取包内版本号。"""
+        assert UpdateChecker().current == __version__
+
+    def test_build_upgrade_hint_returns_copy(self) -> None:
+        """升级提示应返回副本，修改结果不影响全局常量。"""
+        hint = build_upgrade_hint()
+        assert hint == list(UPGRADE_COMMANDS)
+
+        hint.clear()
+        assert build_upgrade_hint() == list(UPGRADE_COMMANDS)
+
+
+@pytest.mark.unit
 class TestNetworkHelpers:
     """网络工具的纯逻辑与异常包装。"""
 
@@ -581,6 +743,68 @@ class _FakeSession:
             假响应对象。
         """
         return self._response
+
+
+class _FakePypiResponse:
+    """``urllib.request.urlopen`` 返回对象的测试替身。"""
+
+    def __init__(self, payload: Any) -> None:
+        """保存要序列化为 JSON 的响应体。
+
+        Args:
+            payload: 任意可 JSON 序列化的对象。
+        """
+        self._payload = payload
+
+    def __enter__(self) -> "_FakePypiResponse":
+        """进入上下文。"""
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        """退出上下文。"""
+        return False
+
+    def read(self) -> bytes:
+        """返回 JSON 编码后的字节串。"""
+        return json.dumps(self._payload).encode("utf-8")
+
+
+class _StuckThread:
+    """永不完成的假线程，用于覆盖 ``wait`` 的超时分支。"""
+
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+
+    def join(self, timeout: float | None = None) -> None:
+        """记录调用方传入的超时，并立即返回。
+
+        Args:
+            timeout: ``wait`` 传入的等待上限。
+        """
+        self.timeout = timeout
+
+
+def patch_pypi(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    payload: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    """把 PyPI 查询替换为本地假响应。
+
+    Args:
+        monkeypatch: pytest 的 monkeypatch 夹具。
+        payload: 假响应 JSON；``error`` 非空时忽略。
+        error: 模拟网络异常时抛出的异常对象。
+    """
+
+    def fake_urlopen(_request: Any, timeout: float | None = None) -> Any:
+        _ = timeout
+        if error is not None:
+            raise error
+        return _FakePypiResponse(payload)
+
+    monkeypatch.setattr(updater_module.urllib.request, "urlopen", fake_urlopen)
 
 
 def await_result(coro: Any) -> Any:
